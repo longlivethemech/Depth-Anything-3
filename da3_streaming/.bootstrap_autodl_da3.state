@@ -1,0 +1,13 @@
+BOOTSTRAP_AT=2026-05-04T16:13:10+08:00
+REMOTE_REPO_ROOT=/root/autodl-fs/code/Depth-Anything-3
+REMOTE_PYTHON=/root/autodl-tmp/envs/da3-streaming/current/bin/python
+NUMPY_VERSION=1.26.4
+SCIPY_VERSION=1.14.1
+NETWORK_TURBO_STATUS=enabled
+TORCH_HOME=/root/.cache/torch
+TORCH_HUB_REPO=/root/.cache/torch/hub/facebookresearch_dinov2_main
+DINO_CHECKPOINT=/root/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth
+CONFIG_FILE=/root/autodl-fs/code/Depth-Anything-3/da3_streaming/configs/base_config.yaml
+WEIGHTS_DIR=/root/autodl-fs/code/Depth-Anything-3/da3_streaming/weights
+ENV_FILE=/root/autodl-fs/code/Depth-Anything-3/da3_streaming/.bootstrap_autodl_da3.env
+LD_LIBRARY_PATH_BASE=/root/autodl-tmp/envs/da3-streaming/current/lib/python3.12/site-packages/nvidia/cu13/lib:/root/autodl-tmp/envs/da3-streaming/current/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/root/autodl-tmp/envs/da3-streaming/current/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/root/autodl-tmp/envs/da3-streaming/current/lib/python3.12/site-packages/nvidia/nvjitlink/lib

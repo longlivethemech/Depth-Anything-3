@@ -625,6 +625,35 @@ class DA3_Streaming:
 
         print("Apply alignment")
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
+
+        if len(self.chunk_indices) == 1:
+            chunk_data_first = np.load(
+                os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
+            ).item()
+            np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
+            points_first = depth_to_point_cloud_vectorized(
+                chunk_data_first.depth,
+                chunk_data_first.intrinsics,
+                chunk_data_first.extrinsics,
+            )
+            colors_first = chunk_data_first.processed_images
+            confs_first = chunk_data_first.conf
+            ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
+            save_confident_pointcloud_batch(
+                points=points_first,
+                colors=colors_first,
+                confs=confs_first,
+                output_path=ply_path_first,
+                conf_threshold=np.mean(confs_first)
+                * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+            )
+            if self.config["Model"]["save_depth_conf_result"]:
+                predictions = chunk_data_first
+                self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
+            self.save_camera_poses()
+            print("Done.")
+            return
         for chunk_idx in range(len(self.chunk_indices) - 1):
             print(f"Applying {chunk_idx+1} -> {chunk_idx} (Total {len(self.chunk_indices)-1})")
             s, R, t = self.sim3_list[chunk_idx]
@@ -737,9 +766,12 @@ class DA3_Streaming:
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
 
-        for i, idx in enumerate(
-            range(first_chunk_range[0], first_chunk_range[1] - self.overlap_e)
-        ):
+        first_chunk_end = (
+            first_chunk_range[1]
+            if len(self.all_camera_poses) == 1
+            else first_chunk_range[1] - self.overlap_e
+        )
+        for i, idx in enumerate(range(first_chunk_range[0], first_chunk_end)):
             w2c = np.eye(4)
             w2c[:3, :] = first_chunk_extrinsics[i]
             c2w = np.linalg.inv(w2c)

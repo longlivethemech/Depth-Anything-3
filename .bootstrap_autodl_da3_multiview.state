@@ -1,0 +1,7 @@
+BOOTSTRAP_AT=2026-05-03T21:25:26+08:00
+REMOTE_REPO_ROOT=/root/autodl-fs/code/Depth-Anything-3
+REMOTE_PYTHON=/root/autodl-tmp/envs/da3-multiview/current/bin/python
+MODEL_DIR=/root/autodl-fs/da3-weights
+NETWORK_TURBO_STATUS=enabled
+ENV_FILE=/root/autodl-fs/code/Depth-Anything-3/.bootstrap_autodl_da3_multiview.env
+LD_LIBRARY_PATH_BASE=/root/miniconda3/lib/python3.12/site-packages/nvidia/cu13/lib:/root/miniconda3/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/cuda-12.4/targets/x86_64-linux/lib
