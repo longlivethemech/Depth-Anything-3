@@ -23,6 +23,8 @@ import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import matplotlib
 import matplotlib.pyplot as plt
@@ -81,6 +83,141 @@ def effective_cpu_count(default=4):
         pass
 
     return max(1, os.cpu_count() or default)
+
+
+def resolve_device_dtype(device=None, dtype=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if dtype is None:
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        else:
+            dtype = torch.float32
+    elif isinstance(dtype, str):
+        dtype = getattr(torch, dtype)
+    return device, dtype
+
+
+def _abs_path(path, base_dir=None):
+    if path is None:
+        return None
+    path = os.fspath(path)
+    if os.path.isabs(path):
+        return path
+    if base_dir is None:
+        base_dir = os.getcwd()
+    return os.path.abspath(os.path.join(os.fspath(base_dir), path))
+
+
+def _path_marker(path):
+    if path is None:
+        return None
+    abs_path = os.path.abspath(os.fspath(path))
+    marker = {"path": abs_path, "exists": os.path.exists(abs_path)}
+    if marker["exists"]:
+        stat = os.stat(abs_path)
+        marker.update({"mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+    return marker
+
+
+def _config_with_absolute_weight_paths(config, base_dir=None):
+    resolved = deepcopy(config)
+    weights = resolved.get("Weights", {})
+    for key in ("DA3_CONFIG", "DA3", "SALAD"):
+        if key in weights and weights[key]:
+            weights[key] = _abs_path(weights[key], base_dir)
+    return resolved
+
+
+def load_job_config(config_path, base_dir=None, absolute_paths=False):
+    resolved_config_path = _abs_path(config_path, base_dir) if absolute_paths else config_path
+    config = load_config(resolved_config_path)
+    if absolute_paths:
+        config = _config_with_absolute_weight_paths(config, base_dir)
+    return config, resolved_config_path
+
+
+@dataclass
+class DA3RuntimeAssets:
+    model: object
+    device: str
+    dtype: object
+    loop_detector_model: object = None
+    loop_detector_device: object = None
+    cache_key: str = ""
+    numba_warmed: bool = False
+
+
+def runtime_assets_cache_key(config, config_path=None, device=None, dtype=None):
+    device, dtype = resolve_device_dtype(device=device, dtype=dtype)
+    weights = config.get("Weights", {})
+    key_payload = {
+        "da3_config": _path_marker(weights.get("DA3_CONFIG")),
+        "da3_weights": _path_marker(weights.get("DA3")),
+        "device": str(device),
+        "dtype": str(dtype),
+        "loop_enable": bool(config.get("Model", {}).get("loop_enable")),
+    }
+    if key_payload["loop_enable"]:
+        key_payload["salad_weights"] = _path_marker(weights.get("SALAD"))
+    return json.dumps(key_payload, sort_keys=True)
+
+
+def build_runtime_assets(config, config_path=None, device=None, dtype=None):
+    assets_started = timing_now()
+    device, dtype = resolve_device_dtype(device=device, dtype=dtype)
+
+    print("Preloading DA3 runtime assets...")
+    da3_config_started = timing_now()
+    with open(config["Weights"]["DA3_CONFIG"]) as f:
+        da3_config = json.load(f)
+    print_timing("da3.runtime_assets.load_da3_json_config", da3_config_started)
+
+    construct_model_started = timing_now()
+    model = DepthAnything3(**da3_config)
+    print_timing("da3.runtime_assets.construct_depthanything3", construct_model_started)
+
+    load_weights_started = timing_now()
+    weight = load_file(config["Weights"]["DA3"])
+    print_timing("da3.runtime_assets.load_safetensors", load_weights_started)
+
+    load_state_dict_started = timing_now()
+    model.load_state_dict(weight, strict=False)
+    print_timing("da3.runtime_assets.load_state_dict", load_state_dict_started)
+
+    model_to_device_started = timing_now()
+    model.eval()
+    model = model.to(device)
+    print_timing("da3.runtime_assets.model_eval_to_device", model_to_device_started)
+
+    loop_detector_model = None
+    loop_detector_device = None
+    if config["Model"]["loop_enable"]:
+        loop_detector_construct_started = timing_now()
+        loop_detector = LoopDetector(image_dir="", output="", config=config)
+        print_timing(
+            "da3.runtime_assets.loop_detector_construct", loop_detector_construct_started
+        )
+        loop_detector_load_started = timing_now()
+        loop_detector_model, loop_detector_device = loop_detector.load_model()
+        print_timing(
+            "da3.runtime_assets.loop_detector_load_model", loop_detector_load_started
+        )
+        loop_detector.image_paths = None
+        loop_detector.descriptors = None
+        loop_detector.loop_closures = None
+        del loop_detector
+
+    assets = DA3RuntimeAssets(
+        model=model,
+        device=device,
+        dtype=dtype,
+        loop_detector_model=loop_detector_model,
+        loop_detector_device=loop_detector_device,
+        cache_key=runtime_assets_cache_key(config, config_path, device=device, dtype=dtype),
+    )
+    print_timing("da3.runtime_assets.total", assets_started)
+    return assets
 
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
@@ -163,7 +300,7 @@ def remove_duplicates(data_list):
 
 
 class DA3_Streaming:
-    def __init__(self, image_dir, save_dir, config):
+    def __init__(self, image_dir, save_dir, config, runtime_assets=None):
         init_started = timing_now()
         self.config = config
 
@@ -173,10 +310,16 @@ class DA3_Streaming:
         self.overlap_e = self.overlap - self.overlap_s
         self.conf_threshold = 1.5
         self.seed = 42
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = (
-            torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        self.runtime_assets = runtime_assets
+        self._uses_preloaded_model = runtime_assets is not None
+        self._uses_preloaded_loop_detector = (
+            runtime_assets is not None and runtime_assets.loop_detector_model is not None
         )
+        if runtime_assets is not None:
+            self.device = runtime_assets.device
+            self.dtype = runtime_assets.dtype
+        else:
+            self.device, self.dtype = resolve_device_dtype()
 
         self.img_dir = image_dir
         self.img_list = None
@@ -199,27 +342,31 @@ class DA3_Streaming:
 
         print("Loading model...")
 
-        da3_config_started = timing_now()
-        with open(self.config["Weights"]["DA3_CONFIG"]) as f:
-            config = json.load(f)
-        print_timing("da3.init.load_da3_json_config", da3_config_started)
+        if runtime_assets is not None:
+            self.model = runtime_assets.model
+            print("[RESIDENT] Reusing preloaded DA3 model")
+        else:
+            da3_config_started = timing_now()
+            with open(self.config["Weights"]["DA3_CONFIG"]) as f:
+                config = json.load(f)
+            print_timing("da3.init.load_da3_json_config", da3_config_started)
 
-        construct_model_started = timing_now()
-        self.model = DepthAnything3(**config)
-        print_timing("da3.init.construct_depthanything3", construct_model_started)
+            construct_model_started = timing_now()
+            self.model = DepthAnything3(**config)
+            print_timing("da3.init.construct_depthanything3", construct_model_started)
 
-        load_weights_started = timing_now()
-        weight = load_file(self.config["Weights"]["DA3"])
-        print_timing("da3.init.load_safetensors", load_weights_started)
+            load_weights_started = timing_now()
+            weight = load_file(self.config["Weights"]["DA3"])
+            print_timing("da3.init.load_safetensors", load_weights_started)
 
-        load_state_dict_started = timing_now()
-        self.model.load_state_dict(weight, strict=False)
-        print_timing("da3.init.load_state_dict", load_state_dict_started)
+            load_state_dict_started = timing_now()
+            self.model.load_state_dict(weight, strict=False)
+            print_timing("da3.init.load_state_dict", load_state_dict_started)
 
-        model_to_device_started = timing_now()
-        self.model.eval()
-        self.model = self.model.to(self.device)
-        print_timing("da3.init.model_eval_to_device", model_to_device_started)
+            model_to_device_started = timing_now()
+            self.model.eval()
+            self.model = self.model.to(self.device)
+            print_timing("da3.init.model_eval_to_device", model_to_device_started)
 
         self.skyseg_session = None
 
@@ -244,9 +391,14 @@ class DA3_Streaming:
                 image_dir=image_dir, output=loop_info_save_path, config=self.config
             )
             print_timing("da3.init.loop_detector_construct", loop_detector_construct_started)
-            loop_detector_load_started = timing_now()
-            self.loop_detector.load_model()
-            print_timing("da3.init.loop_detector_load_model", loop_detector_load_started)
+            if self._uses_preloaded_loop_detector:
+                self.loop_detector.model = runtime_assets.loop_detector_model
+                self.loop_detector.device = runtime_assets.loop_detector_device
+                print("[RESIDENT] Reusing preloaded loop detector model")
+            else:
+                loop_detector_load_started = timing_now()
+                self.loop_detector.load_model()
+                print_timing("da3.init.loop_detector_load_model", loop_detector_load_started)
 
         print("init done.")
         print_timing("da3.init.total", init_started)
@@ -679,7 +831,7 @@ class DA3_Streaming:
         if self.loop_enable:
             loop_total_started = timing_now()
             self.loop_list = self.get_loop_pairs()
-            del self.loop_detector  # Save GPU Memory
+            self.release_loop_detector_session()  # Save GPU memory while preserving runtime assets.
 
             torch.cuda.empty_cache()
 
@@ -857,6 +1009,34 @@ class DA3_Streaming:
         self.process_long_sequence()
         print_timing("da3.run.total", run_started)
 
+    def release_loop_detector_session(self):
+        loop_detector = getattr(self, "loop_detector", None)
+        if loop_detector is None:
+            return
+        loop_detector.image_paths = None
+        loop_detector.descriptors = None
+        loop_detector.loop_closures = None
+        if self._uses_preloaded_loop_detector:
+            loop_detector.model = None
+            loop_detector.device = None
+        del self.loop_detector
+
+    def reset_session_state(self):
+        reset_started = timing_now()
+        self.release_loop_detector_session()
+        self.img_list = None
+        self.chunk_indices = None
+        self.all_camera_poses = []
+        self.all_camera_intrinsics = []
+        self.loop_list = []
+        self.sim3_list = []
+        self.loop_sim3_list = []
+        self.loop_predict_list = []
+        self.skyseg_session = None
+        if not self._uses_preloaded_model:
+            self.model = None
+        print_timing("da3.reset_session_state", reset_started)
+
     def save_camera_poses(self):
         save_camera_poses_started = timing_now()
         """
@@ -1030,10 +1210,94 @@ def copy_file(src_path, dst_dir):
         print(f"Copy Error: {e}")
 
 
-if __name__ == "__main__":
+def _default_save_dir(image_dir):
+    current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    exp_dir = "./exps"
+    return os.path.join(exp_dir, image_dir.replace("/", "_"), current_datetime)
 
+
+def run_da3_job(
+    image_dir,
+    config_path="./configs/base_config.yaml",
+    output_dir=None,
+    runtime_assets=None,
+    base_dir=None,
+    absolute_paths=False,
+):
     main_started = timing_now()
 
+    load_config_started = timing_now()
+    config, resolved_config_path = load_job_config(
+        config_path, base_dir=base_dir, absolute_paths=absolute_paths
+    )
+    print_timing("da3.main.load_config", load_config_started)
+
+    if absolute_paths:
+        image_dir = _abs_path(image_dir, base_dir)
+        if output_dir is not None:
+            output_dir = _abs_path(output_dir, base_dir)
+
+    if output_dir is not None:
+        save_dir = output_dir
+    else:
+        save_dir = _default_save_dir(image_dir)
+        if absolute_paths:
+            save_dir = _abs_path(save_dir, base_dir)
+
+    if not os.path.exists(save_dir):
+        save_dir_prepare_started = timing_now()
+        os.makedirs(save_dir)
+        print(f"The exp will be saved under dir: {save_dir}")
+        copy_file(resolved_config_path, save_dir)
+        print_timing("da3.main.prepare_save_dir_and_copy_config", save_dir_prepare_started)
+
+    if config["Model"]["align_lib"] == "numba":
+        if runtime_assets is None or not runtime_assets.numba_warmed:
+            warmup_numba_started = timing_now()
+            warmup_numba()
+            print_timing("da3.main.warmup_numba", warmup_numba_started)
+            if runtime_assets is not None:
+                runtime_assets.numba_warmed = True
+
+    da3_streaming = None
+    try:
+        construct_da3_streaming_started = timing_now()
+        da3_streaming = DA3_Streaming(
+            image_dir, save_dir, config, runtime_assets=runtime_assets
+        )
+        print_timing("da3.main.construct_da3_streaming", construct_da3_streaming_started)
+        run_started = timing_now()
+        da3_streaming.run()
+        print_timing("da3.main.run", run_started)
+        close_started = timing_now()
+        da3_streaming.close()
+        print_timing("da3.main.close", close_started)
+    finally:
+        if da3_streaming is not None:
+            da3_streaming.reset_session_state()
+        del da3_streaming
+        if runtime_assets is None:
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")
+    input_dir = os.path.join(save_dir, "pcd")
+    print("Saving all the point clouds")
+    merge_started = timing_now()
+    merge_ply_files(input_dir, all_ply_path)
+    print_timing("da3.main.merge_ply_files", merge_started)
+    print("DA3-Streaming done.")
+    total_sec = print_timing("da3.main.total", main_started)
+    return {
+        "ok": True,
+        "save_dir": save_dir,
+        "combined_ply": all_ply_path,
+        "runtime_cache_key": getattr(runtime_assets, "cache_key", None),
+        "total_sec": round(total_sec, 3),
+    }
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description="DA3-Streaming")
     parser.add_argument("--image_dir", type=str, required=True, help="Image path")
     parser.add_argument(
@@ -1044,54 +1308,10 @@ if __name__ == "__main__":
         help="Image path",
     )
     parser.add_argument("--output_dir", type=str, required=False, default=None, help="Output path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    run_da3_job(args.image_dir, args.config, args.output_dir)
 
-    load_config_started = timing_now()
-    config = load_config(args.config)
-    print_timing("da3.main.load_config", load_config_started)
 
-    image_dir = args.image_dir
-    path = image_dir.split("/")
-
-    if args.output_dir is not None:
-        save_dir = args.output_dir
-    else:
-        current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        exp_dir = "./exps"
-        save_dir = os.path.join(exp_dir, image_dir.replace("/", "_"), current_datetime)
-
-    if not os.path.exists(save_dir):
-        save_dir_prepare_started = timing_now()
-        os.makedirs(save_dir)
-        print(f"The exp will be saved under dir: {save_dir}")
-        copy_file(args.config, save_dir)
-        print_timing("da3.main.prepare_save_dir_and_copy_config", save_dir_prepare_started)
-
-    if config["Model"]["align_lib"] == "numba":
-        warmup_numba_started = timing_now()
-        warmup_numba()
-        print_timing("da3.main.warmup_numba", warmup_numba_started)
-
-    construct_da3_streaming_started = timing_now()
-    da3_streaming = DA3_Streaming(image_dir, save_dir, config)
-    print_timing("da3.main.construct_da3_streaming", construct_da3_streaming_started)
-    run_started = timing_now()
-    da3_streaming.run()
-    print_timing("da3.main.run", run_started)
-    close_started = timing_now()
-    da3_streaming.close()
-    print_timing("da3.main.close", close_started)
-
-    del da3_streaming
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")
-    input_dir = os.path.join(save_dir, "pcd")
-    print("Saving all the point clouds")
-    merge_started = timing_now()
-    merge_ply_files(input_dir, all_ply_path)
-    print_timing("da3.main.merge_ply_files", merge_started)
-    print("DA3-Streaming done.")
-    print_timing("da3.main.total", main_started)
+if __name__ == "__main__":
+    main()
     sys.exit()
