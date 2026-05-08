@@ -21,6 +21,8 @@ import json
 import os
 import shutil
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import matplotlib
 import matplotlib.pyplot as plt
@@ -48,6 +50,37 @@ from safetensors.torch import load_file
 from depth_anything_3.api import DepthAnything3
 
 matplotlib.use("Agg")
+
+
+def timing_now():
+    return time.perf_counter()
+
+
+def print_timing(label, started_at):
+    elapsed = time.perf_counter() - started_at
+    print(f"[TIMING] {label}: {elapsed:.3f}s")
+    return elapsed
+
+
+def effective_cpu_count(default=4):
+    cpu_max_path = "/sys/fs/cgroup/cpu.max"
+    try:
+        if os.path.exists(cpu_max_path):
+            quota_str, period_str = open(cpu_max_path, "r", encoding="utf-8").read().strip().split()
+            if quota_str != "max":
+                quota = int(quota_str)
+                period = int(period_str)
+                if quota > 0 and period > 0:
+                    return max(1, (quota + period - 1) // period)
+    except Exception:
+        pass
+
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+
+    return max(1, os.cpu_count() or default)
 
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
@@ -131,6 +164,7 @@ def remove_duplicates(data_list):
 
 class DA3_Streaming:
     def __init__(self, image_dir, save_dir, config):
+        init_started = timing_now()
         self.config = config
 
         self.chunk_size = self.config["Model"]["chunk_size"]
@@ -165,14 +199,27 @@ class DA3_Streaming:
 
         print("Loading model...")
 
+        da3_config_started = timing_now()
         with open(self.config["Weights"]["DA3_CONFIG"]) as f:
             config = json.load(f)
-        self.model = DepthAnything3(**config)
-        weight = load_file(self.config["Weights"]["DA3"])
-        self.model.load_state_dict(weight, strict=False)
+        print_timing("da3.init.load_da3_json_config", da3_config_started)
 
+        construct_model_started = timing_now()
+        self.model = DepthAnything3(**config)
+        print_timing("da3.init.construct_depthanything3", construct_model_started)
+
+        load_weights_started = timing_now()
+        weight = load_file(self.config["Weights"]["DA3"])
+        print_timing("da3.init.load_safetensors", load_weights_started)
+
+        load_state_dict_started = timing_now()
+        self.model.load_state_dict(weight, strict=False)
+        print_timing("da3.init.load_state_dict", load_state_dict_started)
+
+        model_to_device_started = timing_now()
         self.model.eval()
         self.model = self.model.to(self.device)
+        print_timing("da3.init.model_eval_to_device", model_to_device_started)
 
         self.skyseg_session = None
 
@@ -192,19 +239,30 @@ class DA3_Streaming:
 
         if self.loop_enable:
             loop_info_save_path = os.path.join(save_dir, "loop_closures.txt")
+            loop_detector_construct_started = timing_now()
             self.loop_detector = LoopDetector(
                 image_dir=image_dir, output=loop_info_save_path, config=self.config
             )
+            print_timing("da3.init.loop_detector_construct", loop_detector_construct_started)
+            loop_detector_load_started = timing_now()
             self.loop_detector.load_model()
+            print_timing("da3.init.loop_detector_load_model", loop_detector_load_started)
 
         print("init done.")
+        print_timing("da3.init.total", init_started)
 
     def get_loop_pairs(self):
+        loop_pairs_started = timing_now()
         self.loop_detector.run()
+        print_timing("da3.loop.loop_detector_run", loop_pairs_started)
+        get_loop_list_started = timing_now()
         loop_list = self.loop_detector.get_loop_list()
+        print_timing("da3.loop.get_loop_list", get_loop_list_started)
+        print_timing("da3.loop.get_loop_pairs_total", loop_pairs_started)
         return loop_list
 
     def save_depth_conf_result(self, predictions, chunk_idx, s, R, T):
+        save_depth_conf_started = timing_now()
         if not self.config["Model"]["save_depth_conf_result"]:
             return
         os.makedirs(self.result_output_dir, exist_ok=True)
@@ -219,11 +277,26 @@ class DA3_Streaming:
             save_indices = list(range(self.overlap_s, chunk_end - chunk_start - self.overlap_e))
 
         print("[save_depth_conf_result] save_indices:")
-
         for local_idx in save_indices:
             global_idx = chunk_start + local_idx
             print(f"{global_idx}, ", end="")
+        print("")
 
+        if not save_indices:
+            print_timing("da3.save_depth_conf_result.total", save_depth_conf_started)
+            return
+
+        save_debug_info = self.config["Model"]["save_debug_info"]
+        configured_max_workers = self.config["Model"].get("save_depth_conf_max_workers")
+        if configured_max_workers is None:
+            max_workers = min(len(save_indices), max(effective_cpu_count() - 1, 1))
+        else:
+            max_workers = min(len(save_indices), max(int(configured_max_workers), 1))
+
+        print(f"[save_depth_conf_result] max_workers={max_workers}")
+
+        def _save_one(local_idx):
+            global_idx = chunk_start + local_idx
             image = predictions.processed_images[local_idx]  # [H, W, 3] uint8
             depth = predictions.depth[local_idx]  # [H, W] float32
             conf = predictions.conf[local_idx]  # [H, W] float32
@@ -232,7 +305,7 @@ class DA3_Streaming:
             filename = f"frame_{global_idx}.npz"
             filepath = os.path.join(self.result_output_dir, filename)
 
-            if self.config["Model"]["save_debug_info"]:
+            if save_debug_info:
                 np.savez_compressed(
                     filepath,
                     image=image,
@@ -248,9 +321,14 @@ class DA3_Streaming:
                 np.savez_compressed(
                     filepath, image=image, depth=depth, conf=conf, intrinsics=intrinsics
                 )
-        print("")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_save_one, save_indices))
+
+        print_timing("da3.save_depth_conf_result.total", save_depth_conf_started)
 
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
+        chunk_total_started = timing_now()
         start_idx, end_idx = range_1
         chunk_image_paths = self.img_list[start_idx:end_idx]
         if range_2 is not None:
@@ -264,6 +342,7 @@ class DA3_Streaming:
             "ref_view_strategy" if not is_loop else "ref_view_strategy_loop"
         ]
 
+        inference_started = timing_now()
         torch.cuda.empty_cache()
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=self.dtype):
@@ -281,6 +360,7 @@ class DA3_Streaming:
                 print(predictions.extrinsics.shape)  # [N, 3, 4] float32 (w2c)
                 print(predictions.intrinsics.shape)  # [N, 3, 3] float32
         torch.cuda.empty_cache()
+        print_timing("da3.process_single_chunk.inference_total", inference_started)
 
         # Save predictions to disk instead of keeping in memory
         if is_loop:
@@ -301,8 +381,12 @@ class DA3_Streaming:
             self.all_camera_poses.append((chunk_range, extrinsics))
             self.all_camera_intrinsics.append((chunk_range, intrinsics))
 
+        save_predictions_started = timing_now()
         np.save(save_path, predictions)
+        print_timing("da3.process_single_chunk.save_predictions", save_predictions_started)
 
+        phase = "loop" if is_loop else "chunk"
+        print_timing(f"da3.process_single_chunk.total[{phase}]", chunk_total_started)
         return predictions
 
     def get_chunk_indices(self):
@@ -521,6 +605,7 @@ class DA3_Streaming:
         plt.close()
 
     def process_long_sequence(self):
+        process_long_sequence_started = timing_now()
         if self.overlap >= self.chunk_size:
             raise ValueError(
                 f"[SETTING ERROR] Overlap ({self.overlap}) \
@@ -572,6 +657,7 @@ class DA3_Streaming:
                     chunk1_depth_conf = None
                     chunk2_depth_conf = None
 
+                sequential_align_started = timing_now()
                 s, R, t = self.align_2pcds(
                     point_map1,
                     conf1,
@@ -582,25 +668,33 @@ class DA3_Streaming:
                     chunk1_depth_conf,
                     chunk2_depth_conf,
                 )
+                print_timing(
+                    f"da3.process_long_sequence.sequential_chunk_align[{chunk_idx-1}->{chunk_idx}]",
+                    sequential_align_started,
+                )
                 self.sim3_list.append((s, R, t))
 
             pre_predictions = cur_predictions
 
         if self.loop_enable:
+            loop_total_started = timing_now()
             self.loop_list = self.get_loop_pairs()
             del self.loop_detector  # Save GPU Memory
 
             torch.cuda.empty_cache()
 
             print("Loop SIM(3) estimating...")
+            process_loop_list_started = timing_now()
             loop_results = process_loop_list(
                 self.chunk_indices,
                 self.loop_list,
                 half_window=int(self.config["Model"]["loop_chunk_size"] / 2),
             )
             loop_results = remove_duplicates(loop_results)
+            print_timing("da3.loop.process_loop_list", process_loop_list_started)
             print(loop_results)
             # return e.g. (31, (1574, 1594), 2, (129, 149))
+            loop_window_reinference_started = timing_now()
             for item in loop_results:
                 single_chunk_predictions = self.process_single_chunk(
                     item[1], range_2=item[3], is_loop=True
@@ -609,20 +703,33 @@ class DA3_Streaming:
                 self.loop_predict_list.append((item, single_chunk_predictions))
                 print(item)
 
+            print_timing("da3.loop.loop_window_reinference_total", loop_window_reinference_started)
+            get_loop_sim3_started = timing_now()
             self.loop_sim3_list = self.get_loop_sim3_from_loop_predict(self.loop_predict_list)
+            print_timing("da3.loop.get_loop_sim3_from_loop_predict", get_loop_sim3_started)
 
+            sequential_to_absolute_started = timing_now()
             input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(
                 self.sim3_list
             )  # just for plot
+            print_timing("da3.loop.sequential_to_absolute_before_opt", sequential_to_absolute_started)
+            optimize_started = timing_now()
             self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
+            print_timing("da3.loop.optimize", optimize_started)
+            optimized_absolute_started = timing_now()
             optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(
                 self.sim3_list
             )  # just for plot
 
+            print_timing("da3.loop.sequential_to_absolute_after_opt", optimized_absolute_started)
+            plot_loop_closure_started = timing_now()
             self.plot_loop_closure(
                 input_abs_poses, optimized_abs_poses, save_name="sim3_opt_result.png"
             )
+            print_timing("da3.loop.plot_loop_closure", plot_loop_closure_started)
+            print_timing("da3.loop.total", loop_total_started)
 
+        apply_alignment_started = timing_now()
         print("Apply alignment")
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
 
@@ -651,8 +758,12 @@ class DA3_Streaming:
             if self.config["Model"]["save_depth_conf_result"]:
                 predictions = chunk_data_first
                 self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
+            save_camera_poses_started = timing_now()
             self.save_camera_poses()
+            print_timing("da3.save_camera_poses", save_camera_poses_started)
+            print_timing("da3.apply_alignment_and_export_total", apply_alignment_started)
             print("Done.")
+            print_timing("da3.process_long_sequence.total", process_long_sequence_started)
             return
         for chunk_idx in range(len(self.chunk_indices) - 1):
             print(f"Applying {chunk_idx+1} -> {chunk_idx} (Total {len(self.chunk_indices)-1})")
@@ -723,11 +834,16 @@ class DA3_Streaming:
                 predictions.depth *= s
                 self.save_depth_conf_result(predictions, chunk_idx + 1, s, R, t)
 
+        save_camera_poses_started = timing_now()
         self.save_camera_poses()
+        print_timing("da3.save_camera_poses", save_camera_poses_started)
+        print_timing("da3.apply_alignment_and_export_total", apply_alignment_started)
 
         print("Done.")
+        print_timing("da3.process_long_sequence.total", process_long_sequence_started)
 
     def run(self):
+        run_started = timing_now()
         print(f"Loading images from {self.img_dir}...")
         self.img_list = sorted(
             glob.glob(os.path.join(self.img_dir, "*.jpg"))
@@ -739,8 +855,10 @@ class DA3_Streaming:
         print(f"Found {len(self.img_list)} images")
 
         self.process_long_sequence()
+        print_timing("da3.run.total", run_started)
 
     def save_camera_poses(self):
+        save_camera_poses_started = timing_now()
         """
         Save camera poses from all chunks to txt and ply files
         - txt file: Each line contains a 4x4 C2W matrix flattened into 16 numbers
@@ -847,8 +965,10 @@ class DA3_Streaming:
                 )
 
         print(f"Camera poses visualization saved to {ply_path}")
+        print_timing("da3.save_camera_poses.total", save_camera_poses_started)
 
     def close(self):
+        close_started = timing_now()
         """
         Clean up temporary files and calculate reclaimed disk space.
 
@@ -889,6 +1009,7 @@ class DA3_Streaming:
         print("Deleting temp files done.")
 
         print(f"Saved disk space: {total_space/1024/1024/1024:.4f} GiB")
+        print_timing("da3.close.total", close_started)
 
 
 def copy_file(src_path, dst_dir):
@@ -911,6 +1032,8 @@ def copy_file(src_path, dst_dir):
 
 if __name__ == "__main__":
 
+    main_started = timing_now()
+
     parser = argparse.ArgumentParser(description="DA3-Streaming")
     parser.add_argument("--image_dir", type=str, required=True, help="Image path")
     parser.add_argument(
@@ -923,7 +1046,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=False, default=None, help="Output path")
     args = parser.parse_args()
 
+    load_config_started = timing_now()
     config = load_config(args.config)
+    print_timing("da3.main.load_config", load_config_started)
 
     image_dir = args.image_dir
     path = image_dir.split("/")
@@ -936,16 +1061,26 @@ if __name__ == "__main__":
         save_dir = os.path.join(exp_dir, image_dir.replace("/", "_"), current_datetime)
 
     if not os.path.exists(save_dir):
+        save_dir_prepare_started = timing_now()
         os.makedirs(save_dir)
         print(f"The exp will be saved under dir: {save_dir}")
         copy_file(args.config, save_dir)
+        print_timing("da3.main.prepare_save_dir_and_copy_config", save_dir_prepare_started)
 
     if config["Model"]["align_lib"] == "numba":
+        warmup_numba_started = timing_now()
         warmup_numba()
+        print_timing("da3.main.warmup_numba", warmup_numba_started)
 
+    construct_da3_streaming_started = timing_now()
     da3_streaming = DA3_Streaming(image_dir, save_dir, config)
+    print_timing("da3.main.construct_da3_streaming", construct_da3_streaming_started)
+    run_started = timing_now()
     da3_streaming.run()
+    print_timing("da3.main.run", run_started)
+    close_started = timing_now()
     da3_streaming.close()
+    print_timing("da3.main.close", close_started)
 
     del da3_streaming
     torch.cuda.empty_cache()
@@ -954,6 +1089,9 @@ if __name__ == "__main__":
     all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")
     input_dir = os.path.join(save_dir, "pcd")
     print("Saving all the point clouds")
+    merge_started = timing_now()
     merge_ply_files(input_dir, all_ply_path)
+    print_timing("da3.main.merge_ply_files", merge_started)
     print("DA3-Streaming done.")
+    print_timing("da3.main.total", main_started)
     sys.exit()

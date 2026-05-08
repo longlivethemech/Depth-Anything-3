@@ -17,6 +17,7 @@
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 import faiss
 import torch
@@ -30,6 +31,16 @@ SALAD_ROOT = os.path.join(CURRENT_DIR, "salad")
 if SALAD_ROOT not in sys.path:
     sys.path.insert(0, SALAD_ROOT)
 from loop_utils.salad.models import helper
+
+
+def timing_now():
+    return time.perf_counter()
+
+
+def print_timing(label, started_at):
+    elapsed = time.perf_counter() - started_at
+    print(f"[TIMING] {label}: {elapsed:.3f}s")
+    return elapsed
 
 
 class VPRModel(nn.Module):
@@ -122,6 +133,8 @@ class LoopDetector:
 
     def load_model(self):
         """Load model"""
+        load_model_started = timing_now()
+        construct_model_started = timing_now()
         model = VPRModel(
             backbone_arch="dinov2_vitb14",
             backbone_config={
@@ -138,18 +151,25 @@ class LoopDetector:
             },
         )
 
+        print_timing("loop.load_model.construct_model", construct_model_started)
+        load_state_dict_started = timing_now()
         model.load_state_dict(torch.load(self.ckpt_path))
+        print_timing("loop.load_model.load_state_dict", load_state_dict_started)
         model = model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_to_device_started = timing_now()
         model = model.to(device)
+        print_timing("loop.load_model.model_to_device", model_to_device_started)
         print(f"Model loaded: {self.ckpt_path}")
 
         self.model = model
         self.device = device
+        print_timing("loop.load_model.total", load_model_started)
         return model, device
 
     def get_image_paths(self):
         """Get paths of all image files in directory"""
+        get_image_paths_started = timing_now()
         image_extensions = [".jpg", ".jpeg", ".png"]
         image_paths = []
 
@@ -159,10 +179,12 @@ class LoopDetector:
 
         image_paths = sorted(image_paths)
         self.image_paths = image_paths
+        print_timing("loop.get_image_paths.total", get_image_paths_started)
         return image_paths
 
     def extract_descriptors(self):
         """Extract image feature descriptors"""
+        extract_descriptors_started = timing_now()
         if self.model is None or self.device is None:
             self.load_model()
 
@@ -171,6 +193,8 @@ class LoopDetector:
 
         transform = self._input_transform(self.image_size)
         descriptors = []
+        batch_prepare_total_sec = 0.0
+        batch_forward_total_sec = 0.0
 
         for i in tqdm(
             range(0, len(self.image_paths), self.batch_size), desc="Extracting features"
@@ -178,6 +202,7 @@ class LoopDetector:
             batch_paths = self.image_paths[i : i + self.batch_size]
             batch_imgs = []
 
+            batch_prepare_started = timing_now()
             for path in batch_paths:
                 try:
                     img = Image.open(path).convert("RGB")
@@ -192,17 +217,23 @@ class LoopDetector:
                     )
                     batch_imgs.append(img)
 
+            batch_prepare_total_sec += time.perf_counter() - batch_prepare_started
             batch_tensor = torch.stack(batch_imgs).to(self.device)
 
+            batch_forward_started = timing_now()
             with torch.no_grad():
                 with torch.autocast(
                     device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float16
                 ):
                     batch_descriptors = self.model(batch_tensor).cpu()
 
+            batch_forward_total_sec += time.perf_counter() - batch_forward_started
             descriptors.append(batch_descriptors)
 
         self.descriptors = torch.cat(descriptors)
+        print(f"[TIMING] loop.extract_descriptors.batch_prepare_total: {batch_prepare_total_sec:.3f}s")
+        print(f"[TIMING] loop.extract_descriptors.batch_forward_total: {batch_forward_total_sec:.3f}s")
+        print_timing("loop.extract_descriptors.total", extract_descriptors_started)
         return self.descriptors
 
     def _apply_nms_filter(self, loop_closures, nms_threshold):
@@ -241,18 +272,23 @@ class LoopDetector:
 
     def find_loop_closures(self):
         """Find loop closures"""
+        find_loop_closures_started = timing_now()
         if self.descriptors is None:
             self.extract_descriptors()
 
         embed_size = self.descriptors.shape[1]
+        faiss_index_started = timing_now()
         faiss_index = faiss.IndexFlatIP(embed_size)
 
         normalized_descriptors = self.descriptors.numpy()
         faiss_index.add(normalized_descriptors)
+        print_timing("loop.find_loop_closures.faiss_index_add", faiss_index_started)
 
+        faiss_search_started = timing_now()
         similarities, indices = faiss_index.search(
             normalized_descriptors, self.top_k + 1
         )  # +1 because self is most similar
+        print_timing("loop.find_loop_closures.faiss_search", faiss_search_started)
 
         loop_closures = []
         for i in range(len(self.descriptors)):
@@ -274,10 +310,12 @@ class LoopDetector:
             loop_closures = self._apply_nms_filter(loop_closures, self.nms_threshold)
 
         self.loop_closures = self._ensure_decending_order(loop_closures)
+        print_timing("loop.find_loop_closures.total", find_loop_closures_started)
         return self.loop_closures
 
     def save_results(self):
         """Save loop detection results to file"""
+        save_results_started = timing_now()
         if self.loop_closures is None:
             self.find_loop_closures()
 
@@ -303,28 +341,42 @@ class LoopDetector:
                 if i >= 9:
                     break
 
+        print_timing("loop.save_results.total", save_results_started)
+
     def get_loop_list(self):
         return [(idx1, idx2) for idx1, idx2, _ in self.loop_closures]
 
     def run(self):
         """Run complete loop detection pipeline"""
+        run_started = timing_now()
         print("Loading model...")
         if self.model is None:
+            load_model_started = timing_now()
             self.load_model()
+            print_timing("loop.run.load_model_if_needed", load_model_started)
 
+        get_image_paths_started = timing_now()
         self.get_image_paths()
+        print_timing("loop.run.get_image_paths", get_image_paths_started)
         if not self.image_paths:
             print(f"No image files found in {self.image_dir}")
             return
 
         print(f"Found {len(self.image_paths)} image files")
 
+        extract_descriptors_started = timing_now()
         self.extract_descriptors()
+        print_timing("loop.run.extract_descriptors", extract_descriptors_started)
 
+        find_loop_closures_started = timing_now()
         self.find_loop_closures()
+        print_timing("loop.run.find_loop_closures", find_loop_closures_started)
 
+        save_results_started = timing_now()
         self.save_results()
+        print_timing("loop.run.save_results", save_results_started)
 
+        print_timing("loop.run.total", run_started)
         return self.loop_closures
 
 
