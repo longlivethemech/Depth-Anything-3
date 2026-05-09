@@ -8,7 +8,7 @@ Current handoff branch / HEAD:
 
 ```text
 branch: autodl-da3-runtime-patches-20260507
-HEAD: 7d55f32c3bc7e2f3060bba6ba65c439ae01d9e55
+HEAD: 3833494d1d588d39ffccc5c6737c9be76fe9ab00
 ```
 
 ## Source
@@ -76,6 +76,36 @@ Runtime behavior:
   - avoids trusting misleading `os.cpu_count()` / `sched_getaffinity()` values on AutoDL containers.
   - 504 was observed as 25 effective vCPU, with default `max_workers=24`.
 
+## Included Changes From 2026-05-08 Resident Runtime Assets Commit
+
+Commit:
+
+```text
+3833494d1d588d39ffccc5c6737c9be76fe9ab00
+da3_streaming: add explicit runtime-assets resident API
+```
+
+Changed files:
+
+```text
+da3_streaming/da3_streaming.py
+```
+
+Runtime behavior:
+
+- Adds explicit resident entry points:
+  - `build_runtime_assets()`
+  - `runtime_assets_cache_key()`
+  - `run_da3_job(..., runtime_assets=...)`
+- Allows `streaming-replay-mvp/da3_resident_runner.py` to reuse loaded DA3 weights and loop-detector assets across chunk jobs.
+- Preserves the CLI path while giving the relay worker a stable API for cold-to-warm chunk execution.
+- Observed on AutoDL 526 during `warm526-20260509-1714`:
+  - chunk 0 cold wall time: `25.029s`
+  - chunk 1 warm wall time: `5.874s`
+  - warm `runner_prepare_context_sec`: `0.004s`
+  - warm `runner_api_run_sec`: `5.863s`
+  - warm runtime cache hit: `true`
+
 ## AutoDL 504 Handoff Check
 
 For developers connecting to AutoDL 504, verify the canonical shared repo first:
@@ -102,7 +132,7 @@ Both paths are expected to report:
 
 ```text
 branch = autodl-da3-runtime-patches-20260507
-HEAD   = 7d55f32c3bc7e2f3060bba6ba65c439ae01d9e55
+HEAD   = 3833494d1d588d39ffccc5c6737c9be76fe9ab00
 origin = https://github.com/longlivethemech/Depth-Anything-3.git
 ```
 
