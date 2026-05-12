@@ -39,7 +39,7 @@ Model:
     enabled: True
     voxel_size: 0.012
     fusion_radius: 0.018
-    conflict_radius: 0.045
+    conflict_radius: 0.07
     integrate_sample_ratio: 0.35
     integrate_conf_threshold_coef: 0.2
     min_weight: 0.0001
