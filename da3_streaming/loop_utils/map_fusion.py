@@ -50,6 +50,7 @@ class VoxelSurfelFusion:
         instant_confirm_weight=3.0,
         instant_confirm_low_conf=False,
         candidate_conflict_policy="skip_against_confirmed",
+        max_integrate_points=0,
         seed=42,
     ):
         self.voxel_size = float(voxel_size)
@@ -68,6 +69,7 @@ class VoxelSurfelFusion:
         self.instant_confirm_weight = float(instant_confirm_weight)
         self.instant_confirm_low_conf = bool(instant_confirm_low_conf)
         self.candidate_conflict_policy = str(candidate_conflict_policy or "skip_against_confirmed")
+        self.max_integrate_points = max(int(max_integrate_points or 0), 0)
         self.rng = np.random.default_rng(int(seed))
         self._voxels = {}
         self._surfels = []
@@ -96,6 +98,7 @@ class VoxelSurfelFusion:
                 "candidate_conflict_policy",
                 "skip_against_confirmed",
             ),
+            max_integrate_points=cfg.get("max_integrate_points", 0),
             seed=cfg.get("seed", seed),
         )
 
@@ -276,9 +279,14 @@ class VoxelSurfelFusion:
         low_conf_threshold = float(low_conf_threshold) if low_conf_threshold is not None else float(conf_threshold)
         stats.skipped_low_conf = int(np.count_nonzero(finite_mask & ~conf_mask))
         indices = np.flatnonzero(valid_mask)
-        if 0.0 < sample_ratio < 1.0 and len(indices) > 0:
-            keep_count = max(1, int(len(indices) * float(sample_ratio)))
-            indices = self.rng.choice(indices, size=keep_count, replace=False)
+        if len(indices) > 0:
+            keep_count = len(indices)
+            if 0.0 < sample_ratio < 1.0:
+                keep_count = max(1, int(len(indices) * float(sample_ratio)))
+            if self.max_integrate_points > 0:
+                keep_count = min(keep_count, self.max_integrate_points)
+            if keep_count < len(indices):
+                indices = self.rng.choice(indices, size=keep_count, replace=False)
 
         stats.valid_points = int(len(indices))
         for idx in indices:
@@ -323,6 +331,7 @@ class VoxelSurfelFusion:
             "low_conf_confirmed": int(low_conf_confirmed),
             "conflict_count": int(self.total_conflicts),
             "support_observation_count": int(sum(int(s["support_observations"]) for s in self._surfels)),
+            "max_integrate_points": int(self.max_integrate_points),
         })
         return result
 
@@ -398,6 +407,7 @@ class VoxelSurfelFusion:
             "instant_confirm_weight": float(self.instant_confirm_weight),
             "instant_confirm_low_conf": bool(self.instant_confirm_low_conf),
             "candidate_conflict_policy": self.candidate_conflict_policy,
+            "max_integrate_points": int(self.max_integrate_points),
         }
 
 

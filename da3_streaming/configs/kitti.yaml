@@ -51,6 +51,7 @@ Model:
     instant_confirm_weight: 8.0
     instant_confirm_low_conf: False
     candidate_conflict_policy: skip_near_any
+    max_integrate_points: 350000
     max_export_points: 0
     seed: 42
 
