@@ -1094,6 +1094,13 @@ class DA3_Streaming:
             allow_pickle=True,
         ).item()
 
+        local_frame_range = self.streaming_chunk_append_local_frame_range(chunk_idx, chunk_data)
+        local_start, local_end = local_frame_range
+        chunk_start = int(self.chunk_indices[chunk_idx][0])
+        global_frame_range = [chunk_start + local_start, chunk_start + local_end]
+        pointcloud_frame_count = local_end - local_start
+        dropped_overlap_frames = local_start if chunk_idx > 0 else 0
+
         accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
         if chunk_idx == 0:
             world_points = depth_to_point_cloud_vectorized(
@@ -1110,17 +1117,25 @@ class DA3_Streaming:
             )
             world_points = apply_sim3_direct_torch(world_points, s, R, t)
 
+        world_points = world_points[local_start:local_end]
+        colors_chunk = chunk_data.processed_images[local_start:local_end]
+        confs_chunk = chunk_data.conf[local_start:local_end]
+
         points = world_points.reshape(-1, 3)
-        colors = (chunk_data.processed_images.reshape(-1, 3)).astype(np.uint8)
-        confs = chunk_data.conf.reshape(-1)
+        colors = (colors_chunk.reshape(-1, 3)).astype(np.uint8)
+        confs = confs_chunk.reshape(-1)
         ply_path = os.path.join(self.pcd_dir, f"{chunk_idx}_pcd.ply")
+        conf_threshold = (
+            np.mean(confs) * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"]
+            if confs.size
+            else np.inf
+        )
         save_confident_pointcloud_batch(
             points=points,
             colors=colors,
             confs=confs,
             output_path=ply_path,
-            conf_threshold=np.mean(confs)
-            * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+            conf_threshold=conf_threshold,
             sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
         )
 
@@ -1132,7 +1147,16 @@ class DA3_Streaming:
             accumulated_sim3,
             camera_poses_path,
             intrinsic_path,
+            local_frame_range=local_frame_range,
         )
+
+        metadata = {
+            "pointcloud_local_frame_range": [local_start, local_end],
+            "pointcloud_frame_range": global_frame_range,
+            "pointcloud_frame_count": pointcloud_frame_count,
+            "pointcloud_dropped_overlap_frames": dropped_overlap_frames,
+            "pointcloud_append_only_new_frames": True,
+        }
 
         print_timing(f"da3.export_streaming_chunk_artifacts[{chunk_idx}]", export_started)
         return {
@@ -1142,7 +1166,15 @@ class DA3_Streaming:
             "camera_poses": camera_poses_path,
             "intrinsic": intrinsic_path,
             "processed_chunk_count": len(self.chunk_indices),
+            "metadata": metadata,
+            **metadata,
         }
+
+    def streaming_chunk_append_local_frame_range(self, chunk_idx, chunk_data):
+        chunk_idx = int(chunk_idx)
+        frame_count = len(chunk_data.extrinsics)
+        local_start = 0 if chunk_idx == 0 else min(int(self.overlap), frame_count)
+        return local_start, frame_count
 
     def save_streaming_chunk_camera_files(
         self,
@@ -1151,6 +1183,7 @@ class DA3_Streaming:
         accumulated_sim3,
         camera_poses_path,
         intrinsic_path,
+        local_frame_range=None,
     ):
         chunk_idx = int(chunk_idx)
         sim3 = accumulated_sim3[chunk_idx - 1] if chunk_idx > 0 else None
@@ -1160,8 +1193,12 @@ class DA3_Streaming:
             S[:3, :3] = s * R
             S[:3, 3] = t
 
+        if local_frame_range is None:
+            local_frame_range = (0, len(chunk_data.extrinsics))
+        local_start, local_end = local_frame_range
+
         with open(camera_poses_path, "w") as pose_file, open(intrinsic_path, "w") as intrinsic_file:
-            for local_idx in range(len(chunk_data.extrinsics)):
+            for local_idx in range(local_start, local_end):
                 w2c = np.eye(4)
                 w2c[:3, :] = chunk_data.extrinsics[local_idx]
                 c2w = np.linalg.inv(w2c)
