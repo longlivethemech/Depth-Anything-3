@@ -108,13 +108,28 @@ class LoopDetector:
         self.top_k = self.config["Loop"]["SALAD"]["top_k"]
         self.use_nms = self.config["Loop"]["SALAD"]["use_nms"]
         self.nms_threshold = self.config["Loop"]["SALAD"]["nms_threshold"]
+        self.nms_mode = self.config["Loop"]["SALAD"].get("nms_mode", "legacy")
+        self.revisit_min_frame_gap = int(
+            self.config["Loop"]["SALAD"].get(
+                "revisit_min_frame_gap",
+                max(90, int(self.nms_threshold) * 3),
+            )
+        )
+        self.revisit_nms_threshold = int(
+            self.config["Loop"]["SALAD"].get(
+                "revisit_nms_threshold",
+                self.nms_threshold,
+            )
+        )
         self.output = output
 
         self.model = None
         self.device = None
         self.image_paths = None
         self.descriptors = None
+        self.raw_loop_closures = None
         self.loop_closures = None
+        self.nms_stats = {}
 
     def _input_transform(self, image_size=None):
         """Create image transformation function"""
@@ -236,8 +251,8 @@ class LoopDetector:
         print_timing("loop.extract_descriptors.total", extract_descriptors_started)
         return self.descriptors
 
-    def _apply_nms_filter(self, loop_closures, nms_threshold):
-        """Apply Non-Maximum Suppression (NMS) filtering to loop pairs"""
+    def _apply_endpoint_nms_filter(self, loop_closures, nms_threshold):
+        """Apply the original endpoint-suppression NMS used by DA3."""
         if not loop_closures or nms_threshold <= 0:
             return loop_closures
 
@@ -266,6 +281,90 @@ class LoopDetector:
             suppressed.update(suppress_range)
 
         return filtered_loops
+
+    def _apply_pair_window_nms_filter(self, loop_closures, nms_threshold):
+        """Suppress only candidates that describe the same two loop windows.
+
+        Endpoint NMS is too aggressive for online SLAM because a high-scoring
+        local match near one endpoint can suppress a true long-baseline revisit.
+        For revisit candidates we only suppress a new pair when both endpoints
+        are close to an already kept pair.
+        """
+        if not loop_closures or nms_threshold <= 0:
+            return loop_closures
+
+        sorted_loops = sorted(loop_closures, key=lambda x: x[2], reverse=True)
+        filtered_loops = []
+
+        for idx1, idx2, sim in sorted_loops:
+            same_loop_window = False
+            for kept_idx1, kept_idx2, _ in filtered_loops:
+                if (
+                    abs(idx1 - kept_idx1) <= nms_threshold
+                    and abs(idx2 - kept_idx2) <= nms_threshold
+                ):
+                    same_loop_window = True
+                    break
+            if same_loop_window:
+                continue
+            filtered_loops.append((idx1, idx2, sim))
+
+        return filtered_loops
+
+    def _apply_nms_filter(self, loop_closures, nms_threshold):
+        """Apply Non-Maximum Suppression (NMS) filtering to loop pairs"""
+        if not loop_closures or nms_threshold <= 0:
+            self.nms_stats = {
+                "mode": self.nms_mode,
+                "raw_count": len(loop_closures or []),
+                "filtered_count": len(loop_closures or []),
+                "revisit_min_frame_gap": int(self.revisit_min_frame_gap),
+            }
+            return loop_closures
+
+        if self.nms_mode != "gap_aware":
+            filtered = self._apply_endpoint_nms_filter(loop_closures, nms_threshold)
+            self.nms_stats = {
+                "mode": "legacy",
+                "raw_count": len(loop_closures),
+                "filtered_count": len(filtered),
+                "nms_threshold": int(nms_threshold),
+                "revisit_min_frame_gap": int(self.revisit_min_frame_gap),
+            }
+            return filtered
+
+        revisit_min_frame_gap = max(int(self.revisit_min_frame_gap), 0)
+        revisit_nms_threshold = max(int(self.revisit_nms_threshold), 0)
+        revisit_loops = []
+        local_loops = []
+        for idx1, idx2, sim in loop_closures:
+            if abs(int(idx2) - int(idx1)) >= revisit_min_frame_gap:
+                revisit_loops.append((idx1, idx2, sim))
+            else:
+                local_loops.append((idx1, idx2, sim))
+
+        revisit_filtered = self._apply_pair_window_nms_filter(
+            revisit_loops,
+            revisit_nms_threshold,
+        )
+        local_filtered = self._apply_endpoint_nms_filter(local_loops, nms_threshold)
+
+        # Put true revisits first so any downstream max-new-window cap spends
+        # budget on loop closures instead of local repeated views.
+        filtered = revisit_filtered + local_filtered
+        self.nms_stats = {
+            "mode": "gap_aware",
+            "raw_count": len(loop_closures),
+            "raw_revisit_count": len(revisit_loops),
+            "raw_local_count": len(local_loops),
+            "filtered_count": len(filtered),
+            "filtered_revisit_count": len(revisit_filtered),
+            "filtered_local_count": len(local_filtered),
+            "nms_threshold": int(nms_threshold),
+            "revisit_nms_threshold": int(revisit_nms_threshold),
+            "revisit_min_frame_gap": int(revisit_min_frame_gap),
+        }
+        return filtered
 
     def _ensure_decending_order(self, tuples_list):
         return [(max(a, b), min(a, b), score) for a, b, score in tuples_list]
@@ -305,9 +404,17 @@ class LoopDetector:
 
         loop_closures = list(set(loop_closures))
         loop_closures.sort(key=lambda x: x[2], reverse=True)
+        self.raw_loop_closures = list(loop_closures)
 
         if self.use_nms and self.nms_threshold > 0:
             loop_closures = self._apply_nms_filter(loop_closures, self.nms_threshold)
+        else:
+            self.nms_stats = {
+                "mode": "disabled",
+                "raw_count": len(loop_closures),
+                "filtered_count": len(loop_closures),
+                "revisit_min_frame_gap": int(self.revisit_min_frame_gap),
+            }
 
         self.loop_closures = self._ensure_decending_order(loop_closures)
         print_timing("loop.find_loop_closures.total", find_loop_closures_started)
@@ -323,6 +430,8 @@ class LoopDetector:
             f.write("# Loop Detection Results (index1, index2, similarity)\n")
             if self.use_nms:
                 f.write(f"# NMS filtering applied, threshold: {self.nms_threshold}\n")
+                for key, value in sorted(self.nms_stats.items()):
+                    f.write(f"# NMS {key}: {value}\n")
             f.write("\n# Loop pairs:\n")
             for i, j, sim in self.loop_closures:
                 f.write(f"{i}, {j}, {sim:.4f}\n")

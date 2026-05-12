@@ -35,6 +35,25 @@ Model:
     sample_ratio: 0.015
     conf_threshold_coef: 0.75 # conf_threshold = np.mean(confs) * conf_threshold_coef
 
+  Pointcloud_Fusion:
+    enabled: True
+    voxel_size: 0.02
+    fusion_radius: 0.03
+    conflict_radius: 0.06
+    integrate_sample_ratio: 0.2
+    integrate_conf_threshold_coef: 0.15
+    min_weight: 0.0001
+    max_weight: 100.0
+    min_export_weight: 0.0
+    min_export_observations: 1
+    confirm_observations: 3
+    confirm_weight: 2.0
+    instant_confirm_weight: 8.0
+    instant_confirm_low_conf: False
+    candidate_conflict_policy: skip_near_any
+    max_export_points: 0
+    seed: 42
+
 Loop:
   SALAD:
     image_size: [336, 336]
@@ -43,6 +62,9 @@ Loop:
     top_k: 5
     use_nms: True
     nms_threshold: 25
+    nms_mode: 'gap_aware'
+    revisit_min_frame_gap: 90
+    revisit_nms_threshold: 25
 
   SIM3_Optimizer:
     lang_version: 'cpp'
