@@ -994,7 +994,21 @@ class DA3_Streaming:
         print("Done.")
         print_timing("da3.process_long_sequence.total", process_long_sequence_started)
 
-    def process_streaming_chunk(self, image_paths, chunk_range, chunk_idx):
+    def process_streaming_chunk(
+        self,
+        image_paths,
+        chunk_range,
+        chunk_idx,
+        enable_loop_detection=False,
+        loop_start_chunk=1,
+        enable_loop_correction=False,
+        loop_min_chunk_gap=0,
+        loop_min_frame_gap=0,
+        loop_max_new_windows=0,
+        loop_detection_interval=1,
+        loop_correction_min_new_windows=2,
+        reexport_corrected_chunks=True,
+    ):
         streaming_chunk_started = timing_now()
         if self.overlap >= self.chunk_size:
             raise ValueError(
