@@ -43,6 +43,9 @@ Loop:
     top_k: 5
     use_nms: True
     nms_threshold: 25
+    nms_mode: 'gap_aware'
+    revisit_min_frame_gap: 90
+    revisit_nms_threshold: 25
 
   SIM3_Optimizer:
     lang_version: 'cpp'
