@@ -33,7 +33,7 @@ Model:
 
   Pointcloud_Save:
     sample_ratio: 0.015
-    conf_threshold_coef: 1.00 # conf_threshold = np.mean(confs) * conf_threshold_coef
+    conf_threshold_coef: 0.75 # conf_threshold = np.mean(confs) * conf_threshold_coef
 
 Loop:
   SALAD:
