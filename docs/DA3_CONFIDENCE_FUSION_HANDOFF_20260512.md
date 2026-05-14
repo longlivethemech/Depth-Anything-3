@@ -189,6 +189,32 @@ do not append it as another chunk layer
 
 Without this bridge/viewer adaptation, the browser may still show duplicate maps even though DA3 is exporting fused maps.
 
+## Recovered Candidate/Confirmed MVP
+
+Update on 2026-05-14: the AutoDL 526 dirty runtime backup contained a later
+candidate/confirmed implementation that had not been committed locally. It has
+now been recovered into this branch.
+
+Recovered behavior:
+
+- Low/medium-confidence observations can be integrated as candidate surfels
+  instead of being dropped immediately.
+- A surfel is exported only after it becomes confirmed.
+- Confirmation is based on real frame/observation ids, not repeated nearby
+  pixels from one frame or one chunk.
+- Neighbor search spans `ceil(conflict_radius / voxel_size)` voxels, so a
+  `0.06` conflict radius with `0.02` voxels checks the full intended area.
+- Default experiment settings were tightened:
+  - `integrate_sample_ratio: 0.2`
+  - `integrate_conf_threshold_coef: 0.15`
+  - `confirm_observations: 3`
+  - `confirm_weight: 2.0`
+  - `instant_confirm_weight: 8.0`
+  - `instant_confirm_low_conf: False`
+  - `candidate_conflict_policy: skip_near_any`
+- Loop candidate diagnostics were also recovered with rotation-aware metadata
+  and gap-aware NMS fields, but this branch remains an isolated experiment.
+
 ## Better MVP Direction
 
 The first fusion MVP helps with ghosting, but holes need a slightly better confidence policy.
