@@ -36,6 +36,7 @@ from loop_utils.alignment_torch import (
 )
 from loop_utils.config_utils import load_config
 from loop_utils.loop_detector import LoopDetector
+from loop_utils.map_fusion import VoxelSurfelFusion
 from loop_utils.sim3loop import Sim3LoopOptimizer
 from loop_utils.sim3utils import (
     accumulate_sim3_transforms,
@@ -381,6 +382,17 @@ class DA3_Streaming:
         self.loop_sim3_list = []  # [(chunk_idx_a, chunk_idx_b, s [1,], R [3,3], T [3,]), ...]
 
         self.loop_predict_list = []
+        self.streaming_loop_detection_history = []
+        self.streaming_loop_detection_seen = set()
+        self.streaming_loop_correction_pending_windows = []
+        self.streaming_map_epoch = 0
+        self.pointcloud_fusion_config = self.config["Model"].get("Pointcloud_Fusion", {})
+        self.pointcloud_fusion_enabled = bool(
+            self.pointcloud_fusion_config.get("enabled", False)
+        )
+        self.streaming_fusion_map = self._new_pointcloud_fusion_map()
+        self.streaming_fusion_map_epoch = 0
+        self.streaming_fusion_integrated_chunks = set()
 
         self.loop_enable = self.config["Model"]["loop_enable"]
 
@@ -412,6 +424,192 @@ class DA3_Streaming:
         print_timing("da3.loop.get_loop_list", get_loop_list_started)
         print_timing("da3.loop.get_loop_pairs_total", loop_pairs_started)
         return loop_list
+
+    def detect_streaming_loop_candidates(
+        self,
+        chunk_idx,
+        min_chunk_gap=0,
+        min_frame_gap=0,
+        max_new_windows=0,
+    ):
+        loop_detection_started = timing_now()
+        if not self.loop_enable:
+            return {
+                "enabled": False,
+                "chunk_idx": int(chunk_idx),
+                "reason": "loop disabled in config",
+                "loop_pairs": [],
+                "loop_windows": [],
+                "new_loop_windows": [],
+            }
+        if not hasattr(self, "loop_detector"):
+            loop_info_save_path = os.path.join(self.output_dir, "loop_closures.txt")
+            loop_detector_construct_started = timing_now()
+            self.loop_detector = LoopDetector(
+                image_dir=self.img_dir, output=loop_info_save_path, config=self.config
+            )
+            print_timing("da3.streaming_loop.loop_detector_construct", loop_detector_construct_started)
+            if self._uses_preloaded_loop_detector and self.runtime_assets is not None:
+                self.loop_detector.model = self.runtime_assets.loop_detector_model
+                self.loop_detector.device = self.runtime_assets.loop_detector_device
+                print("[RESIDENT] Reusing preloaded loop detector model for streaming loop detection")
+            else:
+                loop_detector_load_started = timing_now()
+                self.loop_detector.load_model()
+                print_timing("da3.streaming_loop.loop_detector_load_model", loop_detector_load_started)
+
+        self.loop_detector.image_paths = None
+        self.loop_detector.descriptors = None
+        self.loop_detector.loop_closures = None
+
+        self.loop_list = self.get_loop_pairs()
+        process_loop_list_started = timing_now()
+        loop_results = process_loop_list(
+            self.chunk_indices,
+            self.loop_list,
+            half_window=int(self.config["Model"]["loop_chunk_size"] / 2),
+        )
+        loop_results = remove_duplicates(loop_results)
+        print_timing("da3.streaming_loop.process_loop_list", process_loop_list_started)
+
+        min_chunk_gap = max(int(min_chunk_gap), 0)
+        min_frame_gap = max(int(min_frame_gap), 0)
+        max_new_windows = max(int(max_new_windows), 0)
+        serializable_windows = []
+        new_windows = []
+        rejected_windows = []
+        for item in loop_results:
+            chunk_gap = abs(int(item[0]) - int(item[2]))
+            center_a = (int(item[1][0]) + int(item[1][1])) // 2
+            center_b = (int(item[3][0]) + int(item[3][1])) // 2
+            frame_gap = abs(center_a - center_b)
+            if chunk_gap < min_chunk_gap or frame_gap < min_frame_gap:
+                rejected_windows.append(
+                    {
+                        "chunk_a": int(item[0]),
+                        "range_a": [int(item[1][0]), int(item[1][1])],
+                        "chunk_b": int(item[2]),
+                        "range_b": [int(item[3][0]), int(item[3][1])],
+                        "chunk_gap": int(chunk_gap),
+                        "frame_gap": int(frame_gap),
+                        "reject_reason": "below_min_gap",
+                    }
+                )
+                continue
+            key = (
+                int(item[0]),
+                int(item[1][0]),
+                int(item[1][1]),
+                int(item[2]),
+                int(item[3][0]),
+                int(item[3][1]),
+            )
+            window = {
+                "chunk_a": int(item[0]),
+                "range_a": [int(item[1][0]), int(item[1][1])],
+                "chunk_b": int(item[2]),
+                "range_b": [int(item[3][0]), int(item[3][1])],
+                "chunk_gap": int(chunk_gap),
+                "frame_gap": int(frame_gap),
+                "is_new": key not in self.streaming_loop_detection_seen,
+            }
+            serializable_windows.append(window)
+            if key not in self.streaming_loop_detection_seen:
+                if max_new_windows and len(new_windows) >= max_new_windows:
+                    continue
+                new_windows.append(window)
+                self.streaming_loop_detection_seen.add(key)
+
+        loop_pairs = [[int(a), int(b)] for a, b in self.loop_list]
+        info = {
+            "enabled": True,
+            "chunk_idx": int(chunk_idx),
+            "processed_chunk_count": len(self.chunk_indices),
+            "image_count": len(self.img_list or []),
+            "loop_pair_count": len(loop_pairs),
+            "loop_pairs": loop_pairs,
+            "loop_window_count": len(serializable_windows),
+            "new_loop_window_count": len(new_windows),
+            "rejected_loop_window_count": len(rejected_windows),
+            "rejected_loop_windows": rejected_windows,
+            "min_chunk_gap": min_chunk_gap,
+            "min_frame_gap": min_frame_gap,
+            "max_new_windows": max_new_windows,
+            "loop_windows": serializable_windows,
+            "new_loop_windows": new_windows,
+            "wall_sec": print_timing("da3.streaming_loop.total", loop_detection_started),
+        }
+        self.streaming_loop_detection_history.append(info)
+        output_path = os.path.join(self.output_dir, f"streaming_loop_candidates_chunk_{int(chunk_idx)}.json")
+        with open(output_path, "w") as handle:
+            json.dump(info, handle, indent=2)
+            handle.write("\n")
+        info["artifact"] = output_path
+        return info
+
+    def apply_streaming_loop_correction(self, loop_windows, chunk_idx):
+        correction_started = timing_now()
+        if not loop_windows:
+            return None
+
+        new_loop_predict_list = []
+        for window in loop_windows:
+            item = (
+                int(window["chunk_a"]),
+                (int(window["range_a"][0]), int(window["range_a"][1])),
+                int(window["chunk_b"]),
+                (int(window["range_b"][0]), int(window["range_b"][1])),
+            )
+            loop_window_started = timing_now()
+            single_chunk_predictions = self.process_single_chunk(
+                item[1],
+                range_2=item[3],
+                is_loop=True,
+            )
+            new_loop_predict_list.append((item, single_chunk_predictions))
+            self.loop_predict_list.append((item, single_chunk_predictions))
+            print_timing(
+                f"da3.streaming_loop.window_reinference[{item[0]}->{item[2]}]",
+                loop_window_started,
+            )
+
+        get_loop_sim3_started = timing_now()
+        new_loop_sim3 = self.get_loop_sim3_from_loop_predict(new_loop_predict_list)
+        self.loop_sim3_list.extend(new_loop_sim3)
+        print_timing("da3.streaming_loop.get_new_loop_sim3", get_loop_sim3_started)
+
+        input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
+        optimize_started = timing_now()
+        self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
+        optimize_sec = print_timing("da3.streaming_loop.optimize", optimize_started)
+        optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
+        self.streaming_map_epoch += 1
+        self.plot_loop_closure(
+            input_abs_poses,
+            optimized_abs_poses,
+            save_name=f"streaming_sim3_opt_epoch_{self.streaming_map_epoch}.png",
+        )
+
+        info = {
+            "enabled": True,
+            "chunk_idx": int(chunk_idx),
+            "map_epoch": int(self.streaming_map_epoch),
+            "new_loop_window_count": len(loop_windows),
+            "new_loop_sim3_count": len(new_loop_sim3),
+            "total_loop_sim3_count": len(self.loop_sim3_list),
+            "optimized_sequential_transform_count": len(self.sim3_list),
+            "optimize_sec": optimize_sec,
+            "wall_sec": print_timing("da3.streaming_loop.correction_total", correction_started),
+        }
+        output_path = os.path.join(
+            self.output_dir,
+            f"streaming_loop_correction_epoch_{self.streaming_map_epoch}_chunk_{int(chunk_idx)}.json",
+        )
+        with open(output_path, "w") as handle:
+            json.dump(info, handle, indent=2)
+            handle.write("\n")
+        info["artifact"] = output_path
+        return info
 
     def save_depth_conf_result(self, predictions, chunk_idx, s, R, T):
         save_depth_conf_started = timing_now()
@@ -756,6 +954,112 @@ class DA3_Streaming:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
+    def _new_pointcloud_fusion_map(self):
+        return VoxelSurfelFusion.from_config(self.pointcloud_fusion_config, seed=self.seed)
+
+    def _pointcloud_conf_threshold(self, confs):
+        save_cfg = self.config["Model"]["Pointcloud_Save"]
+        return float(np.mean(confs) * save_cfg["conf_threshold_coef"])
+
+    def _pointcloud_sample_ratio(self):
+        if self.pointcloud_fusion_enabled:
+            return float(self.pointcloud_fusion_config.get("integrate_sample_ratio", 1.0))
+        return float(self.config["Model"]["Pointcloud_Save"]["sample_ratio"])
+
+    def _streaming_chunk_world_points(self, chunk_idx, chunk_data, accumulated_sim3):
+        if chunk_idx == 0:
+            return depth_to_point_cloud_vectorized(
+                chunk_data.depth,
+                chunk_data.intrinsics,
+                chunk_data.extrinsics,
+            )
+
+        s, R, t = accumulated_sim3[chunk_idx - 1]
+        world_points = depth_to_point_cloud_optimized_torch(
+            chunk_data.depth,
+            chunk_data.intrinsics,
+            chunk_data.extrinsics,
+        )
+        return apply_sim3_direct_torch(world_points, s, R, t)
+
+    def _load_unaligned_chunk(self, chunk_idx):
+        return np.load(
+            os.path.join(self.result_unaligned_dir, f"chunk_{int(chunk_idx)}.npy"),
+            allow_pickle=True,
+        ).item()
+
+    def _integrate_chunk_into_fusion(self, fusion_map, chunk_idx, chunk_data, accumulated_sim3):
+        world_points = self._streaming_chunk_world_points(chunk_idx, chunk_data, accumulated_sim3)
+        points = world_points.reshape(-1, 3)
+        colors = (chunk_data.processed_images.reshape(-1, 3)).astype(np.uint8)
+        confs = chunk_data.conf.reshape(-1)
+        return fusion_map.integrate(
+            points=points,
+            colors=colors,
+            confs=confs,
+            conf_threshold=self._pointcloud_conf_threshold(confs),
+            sample_ratio=self._pointcloud_sample_ratio(),
+        )
+
+    def _rebuild_streaming_fusion_map(self, accumulated_sim3=None):
+        rebuild_started = timing_now()
+        if accumulated_sim3 is None:
+            accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
+        self.streaming_fusion_map = self._new_pointcloud_fusion_map()
+        self.streaming_fusion_integrated_chunks = set()
+        rebuild_stats = []
+        for chunk_idx in range(len(self.chunk_indices)):
+            chunk_data = self._load_unaligned_chunk(chunk_idx)
+            stats = self._integrate_chunk_into_fusion(
+                self.streaming_fusion_map,
+                chunk_idx,
+                chunk_data,
+                accumulated_sim3,
+            )
+            stats["chunk_index"] = int(chunk_idx)
+            rebuild_stats.append(stats)
+            self.streaming_fusion_integrated_chunks.add(int(chunk_idx))
+        self.streaming_fusion_map_epoch = int(self.streaming_map_epoch)
+        print_timing("da3.streaming_fusion.rebuild_map", rebuild_started)
+        return rebuild_stats
+
+    def _export_fusion_map_ply(self, path_tag):
+        ply_path = os.path.join(self.pcd_dir, f"{path_tag}_pcd.ply")
+        export_stats = self.streaming_fusion_map.export_ply(ply_path)
+        return ply_path, export_stats
+
+    def save_streaming_fused_camera_files(
+        self,
+        accumulated_sim3,
+        camera_poses_path,
+        intrinsic_path,
+    ):
+        with open(camera_poses_path, "w") as pose_file, open(intrinsic_path, "w") as intrinsic_file:
+            for chunk_idx in range(len(self.chunk_indices)):
+                chunk_data = self._load_unaligned_chunk(chunk_idx)
+                sim3 = accumulated_sim3[chunk_idx - 1] if chunk_idx > 0 else None
+                if sim3 is not None:
+                    s, R, t = sim3
+                    S = np.eye(4)
+                    S[:3, :3] = s * R
+                    S[:3, 3] = t
+                for local_idx in range(len(chunk_data.extrinsics)):
+                    w2c = np.eye(4)
+                    w2c[:3, :] = chunk_data.extrinsics[local_idx]
+                    c2w = np.linalg.inv(w2c)
+                    if sim3 is not None:
+                        c2w = S @ c2w
+                        c2w[:3, :3] /= s
+                    flat_pose = c2w.flatten()
+                    pose_file.write(" ".join([str(x) for x in flat_pose]) + "\n")
+
+                    intrinsic = chunk_data.intrinsics[local_idx]
+                    fx = intrinsic[0, 0]
+                    fy = intrinsic[1, 1]
+                    cx = intrinsic[0, 2]
+                    cy = intrinsic[1, 2]
+                    intrinsic_file.write(f"{fx} {fy} {cx} {cy}\n")
+
     def process_long_sequence(self):
         process_long_sequence_started = timing_now()
         if self.overlap >= self.chunk_size:
@@ -994,7 +1298,20 @@ class DA3_Streaming:
         print("Done.")
         print_timing("da3.process_long_sequence.total", process_long_sequence_started)
 
-    def process_streaming_chunk(self, image_paths, chunk_range, chunk_idx):
+    def process_streaming_chunk(
+        self,
+        image_paths,
+        chunk_range,
+        chunk_idx,
+        enable_loop_detection=False,
+        loop_start_chunk=1,
+        enable_loop_correction=False,
+        loop_min_chunk_gap=0,
+        loop_min_frame_gap=0,
+        loop_max_new_windows=0,
+        loop_correction_min_new_windows=2,
+        reexport_corrected_chunks=True,
+    ):
         streaming_chunk_started = timing_now()
         if self.overlap >= self.chunk_size:
             raise ValueError(
@@ -1065,60 +1382,128 @@ class DA3_Streaming:
             )
             self.sim3_list.append((s, R, t))
 
-        artifacts = self.export_streaming_chunk_artifacts(chunk_idx)
+        loop_info = None
+        correction_info = None
+        if enable_loop_detection and self.loop_enable and chunk_idx >= int(loop_start_chunk):
+            loop_info = self.detect_streaming_loop_candidates(
+                chunk_idx,
+                min_chunk_gap=loop_min_chunk_gap,
+                min_frame_gap=loop_min_frame_gap,
+                max_new_windows=loop_max_new_windows,
+            )
+            new_loop_windows = loop_info.get("new_loop_windows") or []
+            if enable_loop_correction and new_loop_windows:
+                self.streaming_loop_correction_pending_windows.extend(new_loop_windows)
+            if enable_loop_correction and self.streaming_loop_correction_pending_windows:
+                min_new_windows = max(int(loop_correction_min_new_windows), 1)
+                if len(self.streaming_loop_correction_pending_windows) >= min_new_windows:
+                    pending_windows = list(self.streaming_loop_correction_pending_windows)
+                    self.streaming_loop_correction_pending_windows = []
+                    correction_info = self.apply_streaming_loop_correction(
+                        pending_windows,
+                        chunk_idx,
+                    )
+            if loop_info is not None:
+                loop_info["pending_loop_window_count"] = len(self.streaming_loop_correction_pending_windows)
+                loop_info["correction_min_new_windows"] = max(int(loop_correction_min_new_windows), 1)
+
+        artifacts = self.export_streaming_chunk_artifacts(
+            chunk_idx,
+            map_epoch=self.streaming_map_epoch,
+            map_mode="corrected" if self.streaming_map_epoch else "provisional",
+        )
+        if loop_info is not None:
+            artifacts["streaming_loop_detection"] = loop_info
+        if correction_info is not None:
+            artifacts["streaming_loop_correction"] = correction_info
+            if reexport_corrected_chunks:
+                artifacts["streaming_loop_corrected_chunks"] = (
+                    self.export_streaming_corrected_chunk_artifacts(correction_info["map_epoch"])
+                )
         print_timing(
             f"da3.process_streaming_chunk.total[{chunk_idx}]",
             streaming_chunk_started,
         )
         return artifacts
 
-    def export_streaming_chunk_artifacts(self, chunk_idx):
+    def export_streaming_chunk_artifacts(
+        self,
+        chunk_idx,
+        *,
+        accumulated_sim3=None,
+        artifact_tag=None,
+        map_epoch=None,
+        map_mode="provisional",
+    ):
         export_started = timing_now()
         chunk_idx = int(chunk_idx)
-        chunk_data = np.load(
-            os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx}.npy"),
-            allow_pickle=True,
-        ).item()
+        chunk_data = self._load_unaligned_chunk(chunk_idx)
 
-        accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
-        if chunk_idx == 0:
-            world_points = depth_to_point_cloud_vectorized(
-                chunk_data.depth,
-                chunk_data.intrinsics,
-                chunk_data.extrinsics,
+        if accumulated_sim3 is None:
+            accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
+        path_tag = str(artifact_tag) if artifact_tag is not None else str(chunk_idx)
+
+        fusion_stats = None
+        pointcloud_mode = "raw_confident_points"
+        requires_map_replace = False
+        if self.pointcloud_fusion_enabled:
+            target_epoch = int(map_epoch) if map_epoch is not None else int(self.streaming_map_epoch)
+            if target_epoch != int(self.streaming_fusion_map_epoch):
+                fusion_stats = {
+                    "rebuild": self._rebuild_streaming_fusion_map(accumulated_sim3)
+                }
+            elif artifact_tag is None and chunk_idx not in self.streaming_fusion_integrated_chunks:
+                integrate_stats = self._integrate_chunk_into_fusion(
+                    self.streaming_fusion_map,
+                    chunk_idx,
+                    chunk_data,
+                    accumulated_sim3,
+                )
+                integrate_stats["chunk_index"] = int(chunk_idx)
+                fusion_stats = {"integrate": integrate_stats}
+                self.streaming_fusion_integrated_chunks.add(chunk_idx)
+
+            ply_path, export_stats = self._export_fusion_map_ply(path_tag)
+            if fusion_stats is None:
+                fusion_stats = {}
+            fusion_stats["export"] = export_stats
+            camera_poses_path = os.path.join(self.output_dir, f"camera_poses_chunk_{path_tag}.txt")
+            intrinsic_path = os.path.join(self.output_dir, f"intrinsic_chunk_{path_tag}.txt")
+            self.save_streaming_fused_camera_files(
+                accumulated_sim3,
+                camera_poses_path,
+                intrinsic_path,
             )
+            pointcloud_mode = "confidence_voxel_surfel_fused_map"
+            requires_map_replace = True
         else:
-            s, R, t = accumulated_sim3[chunk_idx - 1]
-            world_points = depth_to_point_cloud_optimized_torch(
-                chunk_data.depth,
-                chunk_data.intrinsics,
-                chunk_data.extrinsics,
+            world_points = self._streaming_chunk_world_points(
+                chunk_idx,
+                chunk_data,
+                accumulated_sim3,
             )
-            world_points = apply_sim3_direct_torch(world_points, s, R, t)
+            points = world_points.reshape(-1, 3)
+            colors = (chunk_data.processed_images.reshape(-1, 3)).astype(np.uint8)
+            confs = chunk_data.conf.reshape(-1)
+            ply_path = os.path.join(self.pcd_dir, f"{path_tag}_pcd.ply")
+            save_confident_pointcloud_batch(
+                points=points,
+                colors=colors,
+                confs=confs,
+                output_path=ply_path,
+                conf_threshold=self._pointcloud_conf_threshold(confs),
+                sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+            )
 
-        points = world_points.reshape(-1, 3)
-        colors = (chunk_data.processed_images.reshape(-1, 3)).astype(np.uint8)
-        confs = chunk_data.conf.reshape(-1)
-        ply_path = os.path.join(self.pcd_dir, f"{chunk_idx}_pcd.ply")
-        save_confident_pointcloud_batch(
-            points=points,
-            colors=colors,
-            confs=confs,
-            output_path=ply_path,
-            conf_threshold=np.mean(confs)
-            * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-            sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-        )
-
-        camera_poses_path = os.path.join(self.output_dir, f"camera_poses_chunk_{chunk_idx}.txt")
-        intrinsic_path = os.path.join(self.output_dir, f"intrinsic_chunk_{chunk_idx}.txt")
-        self.save_streaming_chunk_camera_files(
-            chunk_idx,
-            chunk_data,
-            accumulated_sim3,
-            camera_poses_path,
-            intrinsic_path,
-        )
+            camera_poses_path = os.path.join(self.output_dir, f"camera_poses_chunk_{path_tag}.txt")
+            intrinsic_path = os.path.join(self.output_dir, f"intrinsic_chunk_{path_tag}.txt")
+            self.save_streaming_chunk_camera_files(
+                chunk_idx,
+                chunk_data,
+                accumulated_sim3,
+                camera_poses_path,
+                intrinsic_path,
+            )
 
         print_timing(f"da3.export_streaming_chunk_artifacts[{chunk_idx}]", export_started)
         return {
@@ -1128,7 +1513,62 @@ class DA3_Streaming:
             "camera_poses": camera_poses_path,
             "intrinsic": intrinsic_path,
             "processed_chunk_count": len(self.chunk_indices),
+            "map_epoch": int(map_epoch) if map_epoch is not None else int(self.streaming_map_epoch),
+            "map_mode": map_mode,
+            "pointcloud_mode": pointcloud_mode,
+            "requires_map_replace": requires_map_replace,
+            "fusion_stats": fusion_stats,
         }
+
+    def export_streaming_corrected_chunk_artifacts(self, map_epoch):
+        corrected_started = timing_now()
+        accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
+        if self.pointcloud_fusion_enabled:
+            rebuild_stats = self._rebuild_streaming_fusion_map(accumulated_sim3)
+            path_tag = f"epoch_{int(map_epoch)}_fused_map"
+            ply_path, export_stats = self._export_fusion_map_ply(path_tag)
+            camera_poses_path = os.path.join(self.output_dir, f"camera_poses_chunk_{path_tag}.txt")
+            intrinsic_path = os.path.join(self.output_dir, f"intrinsic_chunk_{path_tag}.txt")
+            self.save_streaming_fused_camera_files(
+                accumulated_sim3,
+                camera_poses_path,
+                intrinsic_path,
+            )
+            chunk_start = self.chunk_indices[0][0] if self.chunk_indices else 0
+            chunk_end = self.chunk_indices[-1][1] if self.chunk_indices else 0
+            print_timing("da3.streaming_loop.export_corrected_fused_map", corrected_started)
+            return [
+                {
+                    "chunk_index": 0,
+                    "chunk_range": (chunk_start, chunk_end),
+                    "pcd": ply_path,
+                    "camera_poses": camera_poses_path,
+                    "intrinsic": intrinsic_path,
+                    "processed_chunk_count": len(self.chunk_indices),
+                    "map_epoch": int(map_epoch),
+                    "map_mode": "corrected",
+                    "pointcloud_mode": "confidence_voxel_surfel_fused_map",
+                    "requires_map_replace": True,
+                    "fusion_stats": {
+                        "rebuild": rebuild_stats,
+                        "export": export_stats,
+                    },
+                }
+            ]
+
+        corrected_chunks = []
+        for chunk_idx in range(len(self.chunk_indices)):
+            corrected_chunks.append(
+                self.export_streaming_chunk_artifacts(
+                    chunk_idx,
+                    accumulated_sim3=accumulated_sim3,
+                    artifact_tag=f"epoch_{int(map_epoch)}_chunk_{chunk_idx}",
+                    map_epoch=map_epoch,
+                    map_mode="corrected",
+                )
+            )
+        print_timing("da3.streaming_loop.export_corrected_chunks", corrected_started)
+        return corrected_chunks
 
     def save_streaming_chunk_camera_files(
         self,
@@ -1202,6 +1642,13 @@ class DA3_Streaming:
         self.sim3_list = []
         self.loop_sim3_list = []
         self.loop_predict_list = []
+        self.streaming_loop_detection_history = []
+        self.streaming_loop_detection_seen = set()
+        self.streaming_loop_correction_pending_windows = []
+        self.streaming_map_epoch = 0
+        self.streaming_fusion_map = self._new_pointcloud_fusion_map()
+        self.streaming_fusion_map_epoch = 0
+        self.streaming_fusion_integrated_chunks = set()
         self.skyseg_session = None
         if not self._uses_preloaded_model:
             self.model = None
