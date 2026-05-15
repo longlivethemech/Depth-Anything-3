@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 import faiss
+import numpy as np
 import torch
 import torchvision.transforms as T
 from PIL import Image
@@ -129,9 +130,13 @@ class LoopDetector:
         self.device = None
         self.image_paths = None
         self.descriptors = None
+        self.descriptor_image_paths = None
         self.raw_loop_closures = None
         self.loop_closures = None
         self.similarity_matrix = None
+        self.full_pair_similarity_frame_count = 0
+        self.full_pair_loop_closures_frame_count = 0
+        self.full_pair_loop_closures_min_gap = None
         self.nms_stats = {}
 
     def _input_transform(self, image_size=None):
@@ -209,15 +214,40 @@ class LoopDetector:
         if self.image_paths is None:
             self.get_image_paths()
 
+        image_paths = list(self.image_paths)
+        cached_paths = list(self.descriptor_image_paths or [])
+        cache_matches_prefix = (
+            self.descriptors is not None
+            and len(cached_paths) <= len(image_paths)
+            and all(cached == current for cached, current in zip(cached_paths, image_paths))
+        )
+        if self.descriptors is not None and not cache_matches_prefix:
+            print("[LOOP_CACHE] descriptor path set changed; rebuilding descriptor cache")
+            self.descriptors = None
+            self.descriptor_image_paths = None
+            self.raw_loop_closures = None
+            self.loop_closures = None
+            self.similarity_matrix = None
+            self.full_pair_similarity_frame_count = 0
+            self.full_pair_loop_closures_frame_count = 0
+            self.full_pair_loop_closures_min_gap = None
+            cached_paths = []
+
+        start_index = len(cached_paths) if cache_matches_prefix else 0
+        if self.descriptors is not None and start_index == len(image_paths):
+            print(f"[LOOP_CACHE] descriptor cache hit: {len(image_paths)} frames")
+            print_timing("loop.extract_descriptors.total", extract_descriptors_started)
+            return self.descriptors
+
         transform = self._input_transform(self.image_size)
         descriptors = []
         batch_prepare_total_sec = 0.0
         batch_forward_total_sec = 0.0
 
         for i in tqdm(
-            range(0, len(self.image_paths), self.batch_size), desc="Extracting features"
+            range(start_index, len(image_paths), self.batch_size), desc="Extracting features"
         ):
-            batch_paths = self.image_paths[i : i + self.batch_size]
+            batch_paths = image_paths[i : i + self.batch_size]
             batch_imgs = []
 
             batch_prepare_started = timing_now()
@@ -248,7 +278,16 @@ class LoopDetector:
             batch_forward_total_sec += time.perf_counter() - batch_forward_started
             descriptors.append(batch_descriptors)
 
-        self.descriptors = torch.cat(descriptors)
+        new_descriptors = torch.cat(descriptors) if descriptors else None
+        if self.descriptors is not None and new_descriptors is not None:
+            self.descriptors = torch.cat([self.descriptors, new_descriptors])
+        elif new_descriptors is not None:
+            self.descriptors = new_descriptors
+        self.descriptor_image_paths = image_paths
+        print(
+            f"[LOOP_CACHE] descriptor cache appended: start={start_index} "
+            f"new={len(image_paths) - start_index} total={len(image_paths)}"
+        )
         print(f"[TIMING] loop.extract_descriptors.batch_prepare_total: {batch_prepare_total_sec:.3f}s")
         print(f"[TIMING] loop.extract_descriptors.batch_forward_total: {batch_forward_total_sec:.3f}s")
         print_timing("loop.extract_descriptors.total", extract_descriptors_started)
@@ -382,19 +421,68 @@ class LoopDetector:
         normalized_descriptors = self.descriptors.numpy()
         if str(self.candidate_mode) == "full_pair_ranking":
             similarity_started = timing_now()
-            similarity_matrix = normalized_descriptors @ normalized_descriptors.T
+            frame_count = int(normalized_descriptors.shape[0])
+            old_similarity_count = int(self.full_pair_similarity_frame_count or 0)
+            can_extend_similarity = (
+                self.similarity_matrix is not None
+                and 0 < old_similarity_count <= frame_count
+                and self.similarity_matrix.shape == (old_similarity_count, old_similarity_count)
+            )
+            if can_extend_similarity and old_similarity_count == frame_count:
+                similarity_matrix = self.similarity_matrix
+                print(f"[LOOP_CACHE] full-pair similarity cache hit: {frame_count} frames")
+            elif can_extend_similarity:
+                similarity_matrix = np.empty(
+                    (frame_count, frame_count),
+                    dtype=normalized_descriptors.dtype,
+                )
+                similarity_matrix[:old_similarity_count, :old_similarity_count] = self.similarity_matrix
+                new_similarity = (
+                    normalized_descriptors[old_similarity_count:frame_count]
+                    @ normalized_descriptors.T
+                )
+                similarity_matrix[old_similarity_count:frame_count, :] = new_similarity
+                similarity_matrix[:, old_similarity_count:frame_count] = new_similarity.T
+                print(
+                    "[LOOP_CACHE] full-pair similarity cache extended: "
+                    f"{old_similarity_count}->{frame_count} frames"
+                )
+            else:
+                similarity_matrix = normalized_descriptors @ normalized_descriptors.T
+                print(f"[LOOP_CACHE] full-pair similarity rebuilt: {frame_count} frames")
             self.similarity_matrix = similarity_matrix
+            self.full_pair_similarity_frame_count = frame_count
             print_timing("loop.find_loop_closures.full_pair_similarity", similarity_started)
 
-            loop_closures = []
             min_gap = max(int(self.min_pair_frame_gap), 0)
-            frame_count = int(similarity_matrix.shape[0])
-            for i in range(frame_count):
-                for j in range(i + min_gap + 1, frame_count):
-                    loop_closures.append((i, j, float(similarity_matrix[i, j])))
+            old_pair_count = int(self.full_pair_loop_closures_frame_count or 0)
+            can_extend_pairs = (
+                self.raw_loop_closures is not None
+                and self.full_pair_loop_closures_min_gap == min_gap
+                and 0 < old_pair_count <= frame_count
+            )
+            if can_extend_pairs and old_pair_count == frame_count:
+                loop_closures = list(self.raw_loop_closures)
+                print(f"[LOOP_CACHE] full-pair closure cache hit: {frame_count} frames")
+            else:
+                loop_closures = list(self.raw_loop_closures) if can_extend_pairs else []
+                start_new_pairs_at = old_pair_count if can_extend_pairs else 0
+                for i in range(frame_count):
+                    first_j = max(i + min_gap + 1, start_new_pairs_at)
+                    for j in range(first_j, frame_count):
+                        loop_closures.append((i, j, float(similarity_matrix[i, j])))
+                if can_extend_pairs:
+                    print(
+                        "[LOOP_CACHE] full-pair closure cache extended: "
+                        f"{old_pair_count}->{frame_count} frames"
+                    )
+                else:
+                    print(f"[LOOP_CACHE] full-pair closure cache rebuilt: {frame_count} frames")
 
             loop_closures.sort(key=lambda x: x[2], reverse=True)
             self.raw_loop_closures = list(loop_closures)
+            self.full_pair_loop_closures_frame_count = frame_count
+            self.full_pair_loop_closures_min_gap = min_gap
             self.nms_stats = {
                 "mode": "full_pair_ranking",
                 "raw_count": len(loop_closures),

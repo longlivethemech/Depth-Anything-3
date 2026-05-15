@@ -383,6 +383,7 @@ class DA3_Streaming:
         self.loop_predict_list = []
         self.streaming_loop_detection_history = []
         self.streaming_loop_detection_seen = set()
+        self.streaming_loop_correction_seen_chunk_pairs = set()
         self.streaming_loop_correction_pending_windows = []
         self.streaming_map_epoch = 0
         self.streaming_frame_rotation_cache = {}
@@ -885,7 +886,6 @@ class DA3_Streaming:
                 print_timing("da3.streaming_loop.loop_detector_load_model", loop_detector_load_started)
 
         self.loop_detector.image_paths = None
-        self.loop_detector.descriptors = None
         self.loop_detector.loop_closures = None
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
@@ -941,6 +941,9 @@ class DA3_Streaming:
             int(self.config["Loop"]["SALAD"].get("max_serialized_windows", 500)),
             0,
         )
+        correction_chunk_pair_top1 = bool(
+            self.config["Loop"]["SALAD"].get("correction_chunk_pair_top1", True)
+        )
         ranked_loop_window_count = len(deduped_loop_results)
         clustered_loop_window_count = len(clustered_loop_results)
         exported_loop_results = (
@@ -951,6 +954,7 @@ class DA3_Streaming:
         serializable_windows = []
         new_windows = []
         rejected_windows = []
+        correction_pair_suppressed_count = 0
         for annotated in exported_loop_results:
             chunk_gap = int(annotated["chunk_gap"])
             frame_gap = int(annotated["frame_gap"])
@@ -999,6 +1003,13 @@ class DA3_Streaming:
                 int(annotated["range_b"][0]),
                 int(annotated["range_b"][1]),
             )
+            correction_pair_key = tuple(
+                sorted((int(annotated["chunk_a"]), int(annotated["chunk_b"])))
+            )
+            is_new_window = key not in self.streaming_loop_detection_seen
+            correction_pair_unused = (
+                correction_pair_key not in self.streaming_loop_correction_seen_chunk_pairs
+            )
             window = {
                 "chunk_a": int(annotated["chunk_a"]),
                 "range_a": [int(annotated["range_a"][0]), int(annotated["range_a"][1])],
@@ -1032,14 +1043,22 @@ class DA3_Streaming:
                 "full_turn_score": float(annotated["full_turn_score"]),
                 "opportunity_score": float(annotated["opportunity_score"]),
                 "opportunity_boost": float(annotated["opportunity_boost"]),
-                "is_new": key not in self.streaming_loop_detection_seen,
+                "is_new": bool(is_new_window),
+                "correction_pair_key": [int(correction_pair_key[0]), int(correction_pair_key[1])],
+                "correction_pair_unused": bool(correction_pair_unused),
+                "correction_chunk_pair_top1": bool(correction_chunk_pair_top1),
             }
             serializable_windows.append(window)
-            if key not in self.streaming_loop_detection_seen:
+            if is_new_window:
+                if correction_chunk_pair_top1 and not correction_pair_unused:
+                    correction_pair_suppressed_count += 1
+                    self.streaming_loop_detection_seen.add(key)
+                    continue
                 if max_new_windows and len(new_windows) >= max_new_windows:
                     continue
                 new_windows.append(window)
                 self.streaming_loop_detection_seen.add(key)
+                self.streaming_loop_correction_seen_chunk_pairs.add(correction_pair_key)
 
         loop_pairs = [[int(a), int(b)] for a, b in self.loop_list]
         raw_loop_pairs = getattr(self.loop_detector, "raw_loop_closures", None) or []
@@ -1069,6 +1088,9 @@ class DA3_Streaming:
                 0,
             ),
             "new_loop_window_count": len(new_windows),
+            "correction_chunk_pair_top1": correction_chunk_pair_top1,
+            "correction_seen_chunk_pair_count": len(self.streaming_loop_correction_seen_chunk_pairs),
+            "correction_pair_suppressed_count": correction_pair_suppressed_count,
             "rejected_loop_window_count": len(rejected_windows),
             "rejected_loop_windows": rejected_windows,
             "min_chunk_gap": min_chunk_gap,
@@ -1768,7 +1790,7 @@ class DA3_Streaming:
         enable_loop_detection=False,
         loop_start_chunk=1,
         enable_loop_correction=False,
-        loop_min_chunk_gap=0,
+        loop_min_chunk_gap=2,
         loop_min_frame_gap=0,
         loop_max_new_windows=0,
         loop_detection_interval=1,
@@ -2047,6 +2069,7 @@ class DA3_Streaming:
         self.loop_predict_list = []
         self.streaming_loop_detection_history = []
         self.streaming_loop_detection_seen = set()
+        self.streaming_loop_correction_seen_chunk_pairs = set()
         self.streaming_loop_correction_pending_windows = []
         self.streaming_map_epoch = 0
         self.streaming_frame_rotation_cache = {}
