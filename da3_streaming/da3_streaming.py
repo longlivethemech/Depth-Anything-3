@@ -893,10 +893,23 @@ class DA3_Streaming:
                 self.loop_detector.load_model()
                 print_timing("da3.streaming_loop.loop_detector_load_model", loop_detector_load_started)
 
+        min_chunk_gap = max(int(min_chunk_gap), 0)
+        min_frame_gap = max(int(min_frame_gap), 0)
+        max_new_windows = max(int(max_new_windows), 0)
+        max_serialized_windows = max(
+            int(self.config["Loop"]["SALAD"].get("max_serialized_windows", 500)),
+            0,
+        )
+        correction_chunk_pair_top1 = bool(
+            self.config["Loop"]["SALAD"].get("correction_chunk_pair_top1", True)
+        )
+        correction_min_priority = max(
+            float(self.config["Loop"]["SALAD"].get("correction_min_priority", 0.0)),
+            0.0,
+        )
+
         self.loop_detector.image_paths = None
         self.loop_detector.loop_closures = None
-        self.streaming_frame_rotation_cache = {}
-        self.streaming_chunk_rotation_cache = {}
 
         self.loop_list = self.get_streaming_loop_closures()
         loop_pair_scores = self._loop_pair_score_map()
@@ -908,12 +921,31 @@ class DA3_Streaming:
             half_window=int(self.config["Model"]["loop_chunk_size"] / 2),
         )
         annotated_by_key = {}
+        gap_prefilter_suppressed_count = 0
+        priority_prefilter_suppressed_count = 0
         for item, loop_pair in zip(loop_results, self.loop_list):
+            chunk_a = int(item[0])
+            range_a = (int(item[1][0]), int(item[1][1]))
+            chunk_b = int(item[2])
+            range_b = (int(item[3][0]), int(item[3][1]))
+            center_a = (range_a[0] + range_a[1]) // 2
+            center_b = (range_b[0] + range_b[1]) // 2
+            chunk_gap = abs(chunk_a - chunk_b)
+            frame_gap = abs(center_a - center_b)
+            if chunk_gap < min_chunk_gap or frame_gap < min_frame_gap:
+                gap_prefilter_suppressed_count += 1
+                continue
             annotated = self._annotate_streaming_loop_window(
                 item,
                 loop_pair_scores,
                 source_loop_pair=loop_pair,
             )
+            if (
+                correction_min_priority
+                and float(annotated["priority_score"]) <= correction_min_priority
+            ):
+                priority_prefilter_suppressed_count += 1
+                continue
             key = (
                 int(annotated["chunk_a"]),
                 int(annotated["range_a"][0]),
@@ -943,20 +975,6 @@ class DA3_Streaming:
         )
         print_timing("da3.streaming_loop.process_loop_list", process_loop_list_started)
 
-        min_chunk_gap = max(int(min_chunk_gap), 0)
-        min_frame_gap = max(int(min_frame_gap), 0)
-        max_new_windows = max(int(max_new_windows), 0)
-        max_serialized_windows = max(
-            int(self.config["Loop"]["SALAD"].get("max_serialized_windows", 500)),
-            0,
-        )
-        correction_chunk_pair_top1 = bool(
-            self.config["Loop"]["SALAD"].get("correction_chunk_pair_top1", True)
-        )
-        correction_min_priority = max(
-            float(self.config["Loop"]["SALAD"].get("correction_min_priority", 0.0)),
-            0.0,
-        )
         ranked_loop_window_count = len(deduped_loop_results)
         clustered_loop_window_count = len(clustered_loop_results)
         exported_loop_results = (
@@ -968,7 +986,7 @@ class DA3_Streaming:
         new_windows = []
         rejected_windows = []
         correction_pair_suppressed_count = 0
-        correction_priority_suppressed_count = 0
+        correction_priority_suppressed_count = priority_prefilter_suppressed_count
         for annotated in exported_loop_results:
             chunk_gap = int(annotated["chunk_gap"])
             frame_gap = int(annotated["frame_gap"])
@@ -1064,9 +1082,6 @@ class DA3_Streaming:
             }
             serializable_windows.append(window)
             if is_new_window:
-                if correction_min_priority and float(annotated["priority_score"]) < correction_min_priority:
-                    correction_priority_suppressed_count += 1
-                    continue
                 if correction_chunk_pair_top1 and not correction_pair_unused:
                     correction_pair_suppressed_count += 1
                     self.streaming_loop_detection_seen.add(key)
@@ -1098,6 +1113,8 @@ class DA3_Streaming:
             "ranked_loop_window_count": ranked_loop_window_count,
             "clustered_loop_window_count": clustered_loop_window_count,
             "cluster_nms_stats": cluster_nms_stats,
+            "gap_prefilter_suppressed_count": gap_prefilter_suppressed_count,
+            "priority_prefilter_suppressed_count": priority_prefilter_suppressed_count,
             "loop_window_count": len(serializable_windows),
             "serialized_loop_window_count": len(serializable_windows),
             "unserialized_loop_window_count": max(
@@ -1810,8 +1827,8 @@ class DA3_Streaming:
         loop_start_chunk=1,
         enable_loop_correction=False,
         loop_min_chunk_gap=2,
-        loop_min_frame_gap=0,
-        loop_max_new_windows=0,
+        loop_min_frame_gap=30,
+        loop_max_new_windows=3,
         loop_detection_interval=1,
         loop_correction_min_new_windows=2,
         reexport_corrected_chunks=True,
