@@ -45,6 +45,7 @@ Loop:
     min_pair_frame_gap: 10
     max_serialized_windows: 500
     correction_chunk_pair_top1: True
+    correction_min_priority: 0.10
     cluster_nms_enabled: True
     cluster_frame_radius: 10
     cluster_peak_deg_radius: 30.0

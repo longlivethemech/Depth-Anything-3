@@ -944,6 +944,10 @@ class DA3_Streaming:
         correction_chunk_pair_top1 = bool(
             self.config["Loop"]["SALAD"].get("correction_chunk_pair_top1", True)
         )
+        correction_min_priority = max(
+            float(self.config["Loop"]["SALAD"].get("correction_min_priority", 0.0)),
+            0.0,
+        )
         ranked_loop_window_count = len(deduped_loop_results)
         clustered_loop_window_count = len(clustered_loop_results)
         exported_loop_results = (
@@ -955,6 +959,7 @@ class DA3_Streaming:
         new_windows = []
         rejected_windows = []
         correction_pair_suppressed_count = 0
+        correction_priority_suppressed_count = 0
         for annotated in exported_loop_results:
             chunk_gap = int(annotated["chunk_gap"])
             frame_gap = int(annotated["frame_gap"])
@@ -1050,6 +1055,9 @@ class DA3_Streaming:
             }
             serializable_windows.append(window)
             if is_new_window:
+                if correction_min_priority and float(annotated["priority_score"]) < correction_min_priority:
+                    correction_priority_suppressed_count += 1
+                    continue
                 if correction_chunk_pair_top1 and not correction_pair_unused:
                     correction_pair_suppressed_count += 1
                     self.streaming_loop_detection_seen.add(key)
@@ -1089,8 +1097,10 @@ class DA3_Streaming:
             ),
             "new_loop_window_count": len(new_windows),
             "correction_chunk_pair_top1": correction_chunk_pair_top1,
+            "correction_min_priority": correction_min_priority,
             "correction_seen_chunk_pair_count": len(self.streaming_loop_correction_seen_chunk_pairs),
             "correction_pair_suppressed_count": correction_pair_suppressed_count,
+            "correction_priority_suppressed_count": correction_priority_suppressed_count,
             "rejected_loop_window_count": len(rejected_windows),
             "rejected_loop_windows": rejected_windows,
             "min_chunk_gap": min_chunk_gap,
