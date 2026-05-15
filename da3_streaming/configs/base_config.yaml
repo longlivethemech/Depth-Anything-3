@@ -43,6 +43,7 @@ Loop:
     top_k: 5
     candidate_mode: 'full_pair_ranking'
     min_pair_frame_gap: 10
+    max_serialized_windows: 500
     use_nms: True
     nms_threshold: 25
     nms_mode: 'gap_aware'

@@ -877,10 +877,20 @@ class DA3_Streaming:
         min_chunk_gap = max(int(min_chunk_gap), 0)
         min_frame_gap = max(int(min_frame_gap), 0)
         max_new_windows = max(int(max_new_windows), 0)
+        max_serialized_windows = max(
+            int(self.config["Loop"]["SALAD"].get("max_serialized_windows", 500)),
+            0,
+        )
+        ranked_loop_window_count = len(deduped_loop_results)
+        exported_loop_results = (
+            deduped_loop_results[:max_serialized_windows]
+            if max_serialized_windows
+            else deduped_loop_results
+        )
         serializable_windows = []
         new_windows = []
         rejected_windows = []
-        for annotated in deduped_loop_results:
+        for annotated in exported_loop_results:
             chunk_gap = int(annotated["chunk_gap"])
             frame_gap = int(annotated["frame_gap"])
             if chunk_gap < min_chunk_gap or frame_gap < min_frame_gap:
@@ -986,13 +996,20 @@ class DA3_Streaming:
             "rotation_aware_priority": True,
             "rotation_class_counts": rotation_class_counts,
             "loop_pairs": loop_pairs,
+            "ranked_loop_window_count": ranked_loop_window_count,
             "loop_window_count": len(serializable_windows),
+            "serialized_loop_window_count": len(serializable_windows),
+            "unserialized_loop_window_count": max(
+                ranked_loop_window_count - len(exported_loop_results),
+                0,
+            ),
             "new_loop_window_count": len(new_windows),
             "rejected_loop_window_count": len(rejected_windows),
             "rejected_loop_windows": rejected_windows,
             "min_chunk_gap": min_chunk_gap,
             "min_frame_gap": min_frame_gap,
             "max_new_windows": max_new_windows,
+            "max_serialized_windows": max_serialized_windows,
             "loop_windows": serializable_windows,
             "new_loop_windows": new_windows,
             "wall_sec": print_timing("da3.streaming_loop.total", loop_detection_started),
