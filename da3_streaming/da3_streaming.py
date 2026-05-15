@@ -714,8 +714,9 @@ class DA3_Streaming:
             "priority_score": float(priority_score),
         }
 
-    def _loop_pair_score_map(self):
-        closures = getattr(self.loop_detector, "loop_closures", None) or []
+    def _loop_pair_score_map(self, closures=None):
+        if closures is None:
+            closures = getattr(self.loop_detector, "loop_closures", None) or []
         scores = {}
         for idx_a, idx_b, similarity in closures:
             key = tuple(sorted((int(idx_a), int(idx_b))))
@@ -912,7 +913,31 @@ class DA3_Streaming:
         self.loop_detector.loop_closures = None
 
         self.loop_list = self.get_streaming_loop_closures()
-        loop_pair_scores = self._loop_pair_score_map()
+        loop_pair_count_before_chunk_gap_filter = len(self.loop_list)
+        chunk_gap_pair_suppressed_count = 0
+        if min_chunk_gap > 0:
+            frame_chunk_cache = {}
+
+            def chunk_for_frame(frame_idx):
+                frame_idx = int(frame_idx)
+                if frame_idx not in frame_chunk_cache:
+                    frame_chunk_cache[frame_idx] = self._frame_chunk_index(frame_idx)
+                return frame_chunk_cache[frame_idx]
+
+            filtered_loop_list = []
+            for loop_pair in self.loop_list:
+                chunk_a = chunk_for_frame(loop_pair[0])
+                chunk_b = chunk_for_frame(loop_pair[1])
+                if chunk_a is None or chunk_b is None:
+                    chunk_gap_pair_suppressed_count += 1
+                    continue
+                if abs(int(chunk_a) - int(chunk_b)) < min_chunk_gap:
+                    chunk_gap_pair_suppressed_count += 1
+                    continue
+                filtered_loop_list.append(loop_pair)
+            self.loop_list = filtered_loop_list
+
+        loop_pair_scores = self._loop_pair_score_map(self.loop_list)
         process_loop_list_started = timing_now()
         loop_pairs_for_windows = [(int(a), int(b)) for a, b, _ in self.loop_list]
         loop_results = process_loop_list(
@@ -1110,6 +1135,9 @@ class DA3_Streaming:
             "rotation_aware_priority": True,
             "rotation_class_counts": rotation_class_counts,
             "loop_pairs": loop_pairs,
+            "loop_pair_count_before_chunk_gap_filter": loop_pair_count_before_chunk_gap_filter,
+            "chunk_gap_pair_suppressed_count": chunk_gap_pair_suppressed_count,
+            "loop_pair_count_after_chunk_gap_filter": len(self.loop_list),
             "ranked_loop_window_count": ranked_loop_window_count,
             "clustered_loop_window_count": clustered_loop_window_count,
             "cluster_nms_stats": cluster_nms_stats,
