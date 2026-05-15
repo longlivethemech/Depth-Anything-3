@@ -740,7 +740,12 @@ class DA3_Streaming:
         chunk_gap = abs(chunk_a - chunk_b)
         if source_loop_pair is not None and len(source_loop_pair) >= 2:
             source_pair = [int(source_loop_pair[0]), int(source_loop_pair[1])]
-            similarity = float(source_loop_pair[2]) if len(source_loop_pair) >= 3 else 0.0
+            if len(source_loop_pair) >= 3:
+                similarity = float(source_loop_pair[2])
+            else:
+                similarity = float(
+                    loop_pair_scores.get(tuple(sorted(source_pair)), 0.0)
+                )
         else:
             source_pair, similarity = self._best_loop_pair_for_ranges(
                 range_a,
