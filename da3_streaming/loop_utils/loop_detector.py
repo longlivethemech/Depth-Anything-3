@@ -106,6 +106,8 @@ class LoopDetector:
         self.batch_size = self.config["Loop"]["SALAD"]["batch_size"]
         self.similarity_threshold = self.config["Loop"]["SALAD"]["similarity_threshold"]
         self.top_k = self.config["Loop"]["SALAD"]["top_k"]
+        self.candidate_mode = self.config["Loop"]["SALAD"].get("candidate_mode", "legacy_top_k")
+        self.min_pair_frame_gap = int(self.config["Loop"]["SALAD"].get("min_pair_frame_gap", 10))
         self.use_nms = self.config["Loop"]["SALAD"]["use_nms"]
         self.nms_threshold = self.config["Loop"]["SALAD"]["nms_threshold"]
         self.nms_mode = self.config["Loop"]["SALAD"].get("nms_mode", "legacy")
@@ -129,6 +131,7 @@ class LoopDetector:
         self.descriptors = None
         self.raw_loop_closures = None
         self.loop_closures = None
+        self.similarity_matrix = None
         self.nms_stats = {}
 
     def _input_transform(self, image_size=None):
@@ -376,10 +379,36 @@ class LoopDetector:
             self.extract_descriptors()
 
         embed_size = self.descriptors.shape[1]
+        normalized_descriptors = self.descriptors.numpy()
+        if str(self.candidate_mode) == "full_pair_ranking":
+            similarity_started = timing_now()
+            similarity_matrix = normalized_descriptors @ normalized_descriptors.T
+            self.similarity_matrix = similarity_matrix
+            print_timing("loop.find_loop_closures.full_pair_similarity", similarity_started)
+
+            loop_closures = []
+            min_gap = max(int(self.min_pair_frame_gap), 0)
+            frame_count = int(similarity_matrix.shape[0])
+            for i in range(frame_count):
+                for j in range(i + min_gap + 1, frame_count):
+                    loop_closures.append((i, j, float(similarity_matrix[i, j])))
+
+            loop_closures.sort(key=lambda x: x[2], reverse=True)
+            self.raw_loop_closures = list(loop_closures)
+            self.nms_stats = {
+                "mode": "full_pair_ranking",
+                "raw_count": len(loop_closures),
+                "filtered_count": len(loop_closures),
+                "min_pair_frame_gap": int(min_gap),
+                "similarity_threshold_used": False,
+                "top_k_used": False,
+            }
+            self.loop_closures = self._ensure_decending_order(loop_closures)
+            print_timing("loop.find_loop_closures.total", find_loop_closures_started)
+            return self.loop_closures
+
         faiss_index_started = timing_now()
         faiss_index = faiss.IndexFlatIP(embed_size)
-
-        normalized_descriptors = self.descriptors.numpy()
         faiss_index.add(normalized_descriptors)
         print_timing("loop.find_loop_closures.faiss_index_add", faiss_index_started)
 
@@ -396,7 +425,7 @@ class LoopDetector:
                 neighbor_idx = indices[i, j]
                 similarity = similarities[i, j]
 
-                if similarity > self.similarity_threshold and abs(i - neighbor_idx) > 10:
+                if similarity > self.similarity_threshold and abs(i - neighbor_idx) > self.min_pair_frame_gap:
                     if i < neighbor_idx:
                         loop_closures.append((i, neighbor_idx, similarity))
                     else:

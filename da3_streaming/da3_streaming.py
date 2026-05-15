@@ -620,6 +620,91 @@ class DA3_Streaming:
             return camera_path_rotation
         return self._chunk_path_rotation_metrics(chunk_a, chunk_b)
 
+    def _clamp01(self, value):
+        return float(max(0.0, min(1.0, float(value))))
+
+    def _linear_score(self, value, low, high):
+        if high <= low:
+            return 0.0
+        return self._clamp01((float(value) - float(low)) / (float(high) - float(low)))
+
+    def _loop_similarity_matrix(self):
+        similarity_matrix = getattr(self.loop_detector, "similarity_matrix", None)
+        if similarity_matrix is not None:
+            return similarity_matrix
+        descriptors = getattr(self.loop_detector, "descriptors", None)
+        if descriptors is None:
+            return None
+        descriptors = descriptors.numpy()
+        similarity_matrix = descriptors @ descriptors.T
+        self.loop_detector.similarity_matrix = similarity_matrix
+        return similarity_matrix
+
+    def _window_support_score(self, center_a, center_b, half_window=8):
+        similarity_matrix = self._loop_similarity_matrix()
+        if similarity_matrix is None:
+            return 0.0
+        frame_count = int(similarity_matrix.shape[0])
+        a0 = max(0, int(center_a) - half_window)
+        a1 = min(frame_count, int(center_a) + half_window + 1)
+        b0 = max(0, int(center_b) - half_window)
+        b1 = min(frame_count, int(center_b) + half_window + 1)
+        if a0 >= a1 or b0 >= b1:
+            return 0.0
+        local = similarity_matrix[a0:a1, b0:b1]
+        if local.size == 0:
+            return 0.0
+        return self._linear_score(float(np.percentile(local, 90)), 0.60, 0.95)
+
+    def _loop_priority_components(
+        self,
+        similarity,
+        window_support_score,
+        frame_gap,
+        chunk_gap,
+        rotation_metrics,
+    ):
+        total_deg = float(rotation_metrics.get("total_deg", 0.0))
+        peak_deg = float(rotation_metrics.get("peak_deg", 0.0))
+        unwrapped_net_deg = float(
+            rotation_metrics.get("unwrapped_net_deg", rotation_metrics.get("net_deg", 0.0))
+        )
+        one_way_ratio = self._clamp01(unwrapped_net_deg / max(total_deg, 1e-9))
+
+        sim_score = self._linear_score(similarity, 0.60, 0.95)
+        evidence = 0.85 * sim_score + 0.15 * self._clamp01(window_support_score)
+
+        full_turn_score = 1.0 if (
+            peak_deg >= 270.0
+            and unwrapped_net_deg >= 270.0
+            and one_way_ratio >= 0.70
+        ) else 0.0
+        rot_score = self._clamp01(peak_deg / 360.0)
+        frame_gap_score = self._clamp01(float(frame_gap) / 240.0)
+        chunk_gap_score = self._clamp01(float(chunk_gap) / 8.0)
+        opportunity = (
+            0.40 * rot_score
+            + 0.25 * frame_gap_score
+            + 0.15 * chunk_gap_score
+            + 0.15 * one_way_ratio
+            + 0.05 * full_turn_score
+        )
+        opportunity_boost = 0.30 + 0.70 * opportunity
+        priority_score = evidence * opportunity_boost
+        return {
+            "sim_score": float(sim_score),
+            "window_support_score": float(window_support_score),
+            "evidence_score": float(evidence),
+            "rot_score": float(rot_score),
+            "frame_gap_score": float(frame_gap_score),
+            "chunk_gap_score": float(chunk_gap_score),
+            "one_way_score": float(one_way_ratio),
+            "full_turn_score": float(full_turn_score),
+            "opportunity_score": float(opportunity),
+            "opportunity_boost": float(opportunity_boost),
+            "priority_score": float(priority_score),
+        }
+
     def _loop_pair_score_map(self):
         closures = getattr(self.loop_detector, "loop_closures", None) or []
         scores = {}
@@ -644,7 +729,7 @@ class DA3_Streaming:
                 best_pair = [idx_a, idx_b]
         return best_pair, best_similarity
 
-    def _annotate_streaming_loop_window(self, item, loop_pair_scores):
+    def _annotate_streaming_loop_window(self, item, loop_pair_scores, source_loop_pair=None):
         chunk_a = int(item[0])
         range_a = (int(item[1][0]), int(item[1][1]))
         chunk_b = int(item[2])
@@ -653,11 +738,15 @@ class DA3_Streaming:
         center_b = (range_b[0] + range_b[1]) // 2
         frame_gap = abs(center_a - center_b)
         chunk_gap = abs(chunk_a - chunk_b)
-        source_pair, similarity = self._best_loop_pair_for_ranges(
-            range_a,
-            range_b,
-            loop_pair_scores,
-        )
+        if source_loop_pair is not None and len(source_loop_pair) >= 2:
+            source_pair = [int(source_loop_pair[0]), int(source_loop_pair[1])]
+            similarity = float(source_loop_pair[2]) if len(source_loop_pair) >= 3 else 0.0
+        else:
+            source_pair, similarity = self._best_loop_pair_for_ranges(
+                range_a,
+                range_b,
+                loop_pair_scores,
+            )
         rotation_metrics = self._loop_path_rotation_metrics(
             center_a,
             center_b,
@@ -666,11 +755,13 @@ class DA3_Streaming:
         )
         path_rotation_deg = float(rotation_metrics.get("peak_deg", 0.0))
         rotation_class, rotation_class_rank = self._loop_rotation_class(path_rotation_deg)
-        priority_score = (
-            rotation_class_rank * 1_000_000.0
-            + min(path_rotation_deg, 720.0) * 1_000.0
-            + min(frame_gap, 10_000)
-            + similarity
+        window_support_score = self._window_support_score(center_a, center_b)
+        priority_components = self._loop_priority_components(
+            similarity,
+            window_support_score,
+            frame_gap,
+            chunk_gap,
+            rotation_metrics,
         )
         return {
             "item": item,
@@ -695,7 +786,7 @@ class DA3_Streaming:
             "path_rotation_source": rotation_metrics.get("source", "unknown"),
             "rotation_class": rotation_class,
             "rotation_class_rank": rotation_class_rank,
-            "priority_score": priority_score,
+            **priority_components,
         }
 
     def detect_streaming_loop_candidates(
@@ -745,26 +836,36 @@ class DA3_Streaming:
             self.loop_list,
             half_window=int(self.config["Model"]["loop_chunk_size"] / 2),
         )
-        annotated_loop_results = [
-            self._annotate_streaming_loop_window(item, loop_pair_scores)
-            for item in loop_results
-        ]
-        annotated_loop_results.sort(
+        annotated_by_key = {}
+        for item, loop_pair in zip(loop_results, self.loop_list):
+            annotated = self._annotate_streaming_loop_window(
+                item,
+                loop_pair_scores,
+                source_loop_pair=loop_pair,
+            )
+            key = (
+                int(annotated["chunk_a"]),
+                int(annotated["range_a"][0]),
+                int(annotated["range_a"][1]),
+                int(annotated["chunk_b"]),
+                int(annotated["range_b"][0]),
+                int(annotated["range_b"][1]),
+            )
+            existing = annotated_by_key.get(key)
+            if existing is None or annotated["priority_score"] > existing["priority_score"]:
+                annotated_by_key[key] = annotated
+        annotated_loop_results = sorted(
+            annotated_by_key.values(),
             key=lambda x: (
-                x["rotation_class_rank"],
-                x["path_rotation_deg"],
-                x["frame_gap"],
+                x["priority_score"],
+                x["evidence_score"],
+                x["opportunity_score"],
                 x["similarity"],
             ),
             reverse=True,
         )
         deduped_loop_results = []
-        seen_chunk_pairs = set()
         for annotated in annotated_loop_results:
-            chunk_key = tuple(sorted((annotated["chunk_a"], annotated["chunk_b"])))
-            if chunk_key in seen_chunk_pairs:
-                continue
-            seen_chunk_pairs.add(chunk_key)
             deduped_loop_results.append(annotated)
         print_timing("da3.streaming_loop.process_loop_list", process_loop_list_started)
 
@@ -799,6 +900,16 @@ class DA3_Streaming:
                         "path_rotation_source": annotated["path_rotation_source"],
                         "rotation_class": annotated["rotation_class"],
                         "priority_score": float(annotated["priority_score"]),
+                        "sim_score": float(annotated["sim_score"]),
+                        "window_support_score": float(annotated["window_support_score"]),
+                        "evidence_score": float(annotated["evidence_score"]),
+                        "rot_score": float(annotated["rot_score"]),
+                        "frame_gap_score": float(annotated["frame_gap_score"]),
+                        "chunk_gap_score": float(annotated["chunk_gap_score"]),
+                        "one_way_score": float(annotated["one_way_score"]),
+                        "full_turn_score": float(annotated["full_turn_score"]),
+                        "opportunity_score": float(annotated["opportunity_score"]),
+                        "opportunity_boost": float(annotated["opportunity_boost"]),
                         "reject_reason": "below_min_gap",
                     }
                 )
@@ -833,6 +944,16 @@ class DA3_Streaming:
                 "path_rotation_source": annotated["path_rotation_source"],
                 "rotation_class": annotated["rotation_class"],
                 "priority_score": float(annotated["priority_score"]),
+                "sim_score": float(annotated["sim_score"]),
+                "window_support_score": float(annotated["window_support_score"]),
+                "evidence_score": float(annotated["evidence_score"]),
+                "rot_score": float(annotated["rot_score"]),
+                "frame_gap_score": float(annotated["frame_gap_score"]),
+                "chunk_gap_score": float(annotated["chunk_gap_score"]),
+                "one_way_score": float(annotated["one_way_score"]),
+                "full_turn_score": float(annotated["full_turn_score"]),
+                "opportunity_score": float(annotated["opportunity_score"]),
+                "opportunity_boost": float(annotated["opportunity_boost"]),
                 "is_new": key not in self.streaming_loop_detection_seen,
             }
             serializable_windows.append(window)
