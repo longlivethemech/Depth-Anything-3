@@ -420,6 +420,14 @@ class DA3_Streaming:
         print_timing("da3.loop.get_loop_pairs_total", loop_pairs_started)
         return loop_list
 
+    def get_streaming_loop_closures(self):
+        loop_pairs_started = timing_now()
+        self.loop_detector.run(save_results=False, incremental_only=True)
+        print_timing("da3.streaming_loop.loop_detector_run_incremental", loop_pairs_started)
+        closures = list(getattr(self.loop_detector, "loop_closures", None) or [])
+        print_timing("da3.streaming_loop.get_loop_closures_total", loop_pairs_started)
+        return closures
+
     def _rotation_angle_degrees(self, rotation):
         rotation = np.asarray(rotation, dtype=np.float64)
         if rotation.shape != (3, 3):
@@ -890,12 +898,13 @@ class DA3_Streaming:
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
 
-        self.loop_list = self.get_loop_pairs()
+        self.loop_list = self.get_streaming_loop_closures()
         loop_pair_scores = self._loop_pair_score_map()
         process_loop_list_started = timing_now()
+        loop_pairs_for_windows = [(int(a), int(b)) for a, b, _ in self.loop_list]
         loop_results = process_loop_list(
             self.chunk_indices,
-            self.loop_list,
+            loop_pairs_for_windows,
             half_window=int(self.config["Model"]["loop_chunk_size"] / 2),
         )
         annotated_by_key = {}
@@ -1068,7 +1077,7 @@ class DA3_Streaming:
                 self.streaming_loop_detection_seen.add(key)
                 self.streaming_loop_correction_seen_chunk_pairs.add(correction_pair_key)
 
-        loop_pairs = [[int(a), int(b)] for a, b in self.loop_list]
+        loop_pairs = [[int(a), int(b)] for a, b, _ in self.loop_list]
         raw_loop_pairs = getattr(self.loop_detector, "raw_loop_closures", None) or []
         loop_nms_stats = getattr(self.loop_detector, "nms_stats", None) or {}
         rotation_class_counts = {}

@@ -132,6 +132,7 @@ class LoopDetector:
         self.descriptors = None
         self.descriptor_image_paths = None
         self.raw_loop_closures = None
+        self.new_loop_closures = []
         self.loop_closures = None
         self.similarity_matrix = None
         self.full_pair_similarity_frame_count = 0
@@ -226,6 +227,7 @@ class LoopDetector:
             self.descriptors = None
             self.descriptor_image_paths = None
             self.raw_loop_closures = None
+            self.new_loop_closures = []
             self.loop_closures = None
             self.similarity_matrix = None
             self.full_pair_similarity_frame_count = 0
@@ -411,7 +413,7 @@ class LoopDetector:
     def _ensure_decending_order(self, tuples_list):
         return [(max(a, b), min(a, b), score) for a, b, score in tuples_list]
 
-    def find_loop_closures(self):
+    def find_loop_closures(self, incremental_only=False):
         """Find loop closures"""
         find_loop_closures_started = timing_now()
         if self.descriptors is None:
@@ -462,31 +464,46 @@ class LoopDetector:
                 and 0 < old_pair_count <= frame_count
             )
             if can_extend_pairs and old_pair_count == frame_count:
-                loop_closures = list(self.raw_loop_closures)
+                new_loop_closures = []
+                loop_closures = [] if incremental_only else list(self.raw_loop_closures)
                 print(f"[LOOP_CACHE] full-pair closure cache hit: {frame_count} frames")
             else:
-                loop_closures = list(self.raw_loop_closures) if can_extend_pairs else []
+                previous_loop_closures = list(self.raw_loop_closures) if can_extend_pairs else []
+                new_loop_closures = []
                 start_new_pairs_at = old_pair_count if can_extend_pairs else 0
                 for i in range(frame_count):
                     first_j = max(i + min_gap + 1, start_new_pairs_at)
                     for j in range(first_j, frame_count):
-                        loop_closures.append((i, j, float(similarity_matrix[i, j])))
+                        new_loop_closures.append((i, j, float(similarity_matrix[i, j])))
+                loop_closures = (
+                    new_loop_closures
+                    if incremental_only
+                    else previous_loop_closures + new_loop_closures
+                )
+                self.raw_loop_closures = previous_loop_closures + new_loop_closures
                 if can_extend_pairs:
                     print(
                         "[LOOP_CACHE] full-pair closure cache extended: "
-                        f"{old_pair_count}->{frame_count} frames"
+                        f"{old_pair_count}->{frame_count} frames new_pairs={len(new_loop_closures)}"
                     )
                 else:
                     print(f"[LOOP_CACHE] full-pair closure cache rebuilt: {frame_count} frames")
 
             loop_closures.sort(key=lambda x: x[2], reverse=True)
-            self.raw_loop_closures = list(loop_closures)
+            self.new_loop_closures = self._ensure_decending_order(
+                sorted(new_loop_closures, key=lambda x: x[2], reverse=True)
+            )
+            if not incremental_only:
+                self.raw_loop_closures = list(loop_closures)
             self.full_pair_loop_closures_frame_count = frame_count
             self.full_pair_loop_closures_min_gap = min_gap
+            total_raw_count = len(self.raw_loop_closures or loop_closures)
             self.nms_stats = {
                 "mode": "full_pair_ranking",
-                "raw_count": len(loop_closures),
+                "raw_count": total_raw_count,
                 "filtered_count": len(loop_closures),
+                "incremental_only": bool(incremental_only),
+                "new_raw_count": len(new_loop_closures),
                 "min_pair_frame_gap": int(min_gap),
                 "similarity_threshold_used": False,
                 "top_k_used": False,
@@ -572,7 +589,7 @@ class LoopDetector:
     def get_loop_list(self):
         return [(idx1, idx2) for idx1, idx2, _ in self.loop_closures]
 
-    def run(self):
+    def run(self, save_results=True, incremental_only=False):
         """Run complete loop detection pipeline"""
         run_started = timing_now()
         print("Loading model...")
@@ -595,12 +612,13 @@ class LoopDetector:
         print_timing("loop.run.extract_descriptors", extract_descriptors_started)
 
         find_loop_closures_started = timing_now()
-        self.find_loop_closures()
+        self.find_loop_closures(incremental_only=incremental_only)
         print_timing("loop.run.find_loop_closures", find_loop_closures_started)
 
-        save_results_started = timing_now()
-        self.save_results()
-        print_timing("loop.run.save_results", save_results_started)
+        if save_results:
+            save_results_started = timing_now()
+            self.save_results()
+            print_timing("loop.run.save_results", save_results_started)
 
         print_timing("loop.run.total", run_started)
         return self.loop_closures
