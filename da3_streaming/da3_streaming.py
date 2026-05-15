@@ -794,6 +794,63 @@ class DA3_Streaming:
             **priority_components,
         }
 
+    def _same_loop_cluster(self, candidate, kept, config):
+        frame_radius = int(config["frame_radius"])
+        if (
+            abs(int(candidate["center_a"]) - int(kept["center_a"])) > frame_radius
+            or abs(int(candidate["center_b"]) - int(kept["center_b"])) > frame_radius
+        ):
+            return False
+        if str(candidate.get("rotation_class")) != str(kept.get("rotation_class")):
+            return False
+        rotation_checks = (
+            ("path_rotation_peak_deg", "peak_deg_radius"),
+            ("path_rotation_unwrapped_net_deg", "net_deg_radius"),
+            ("path_rotation_total_deg", "total_deg_radius"),
+        )
+        for value_key, radius_key in rotation_checks:
+            if abs(float(candidate.get(value_key, 0.0)) - float(kept.get(value_key, 0.0))) > float(config[radius_key]):
+                return False
+        return True
+
+    def _cluster_ranked_loop_windows(self, ranked_loop_results):
+        salad_cfg = self.config["Loop"]["SALAD"]
+        config = {
+            "enabled": bool(salad_cfg.get("cluster_nms_enabled", True)),
+            "frame_radius": int(salad_cfg.get("cluster_frame_radius", 10)),
+            "peak_deg_radius": float(salad_cfg.get("cluster_peak_deg_radius", 30.0)),
+            "net_deg_radius": float(salad_cfg.get("cluster_net_deg_radius", 30.0)),
+            "total_deg_radius": float(salad_cfg.get("cluster_total_deg_radius", 60.0)),
+        }
+        if not config["enabled"]:
+            for item in ranked_loop_results:
+                item["cluster_size"] = int(item.get("cluster_size", 1))
+            return ranked_loop_results, {
+                **config,
+                "input_count": len(ranked_loop_results),
+                "kept_count": len(ranked_loop_results),
+                "suppressed_count": 0,
+            }
+
+        kept = []
+        for candidate in ranked_loop_results:
+            matched = None
+            for existing in kept:
+                if self._same_loop_cluster(candidate, existing, config):
+                    matched = existing
+                    break
+            if matched is not None:
+                matched["cluster_size"] = int(matched.get("cluster_size", 1)) + 1
+                continue
+            candidate["cluster_size"] = 1
+            kept.append(candidate)
+        return kept, {
+            **config,
+            "input_count": len(ranked_loop_results),
+            "kept_count": len(kept),
+            "suppressed_count": len(ranked_loop_results) - len(kept),
+        }
+
     def detect_streaming_loop_candidates(
         self,
         chunk_idx,
@@ -872,6 +929,9 @@ class DA3_Streaming:
         deduped_loop_results = []
         for annotated in annotated_loop_results:
             deduped_loop_results.append(annotated)
+        clustered_loop_results, cluster_nms_stats = self._cluster_ranked_loop_windows(
+            deduped_loop_results
+        )
         print_timing("da3.streaming_loop.process_loop_list", process_loop_list_started)
 
         min_chunk_gap = max(int(min_chunk_gap), 0)
@@ -882,10 +942,11 @@ class DA3_Streaming:
             0,
         )
         ranked_loop_window_count = len(deduped_loop_results)
+        clustered_loop_window_count = len(clustered_loop_results)
         exported_loop_results = (
-            deduped_loop_results[:max_serialized_windows]
+            clustered_loop_results[:max_serialized_windows]
             if max_serialized_windows
-            else deduped_loop_results
+            else clustered_loop_results
         )
         serializable_windows = []
         new_windows = []
@@ -914,6 +975,7 @@ class DA3_Streaming:
                         "path_rotation_measured_steps": int(annotated["path_rotation_measured_steps"]),
                         "path_rotation_source": annotated["path_rotation_source"],
                         "rotation_class": annotated["rotation_class"],
+                        "cluster_size": int(annotated.get("cluster_size", 1)),
                         "priority_score": float(annotated["priority_score"]),
                         "sim_score": float(annotated["sim_score"]),
                         "window_support_score": float(annotated["window_support_score"]),
@@ -958,6 +1020,7 @@ class DA3_Streaming:
                 "path_rotation_measured_steps": int(annotated["path_rotation_measured_steps"]),
                 "path_rotation_source": annotated["path_rotation_source"],
                 "rotation_class": annotated["rotation_class"],
+                "cluster_size": int(annotated.get("cluster_size", 1)),
                 "priority_score": float(annotated["priority_score"]),
                 "sim_score": float(annotated["sim_score"]),
                 "window_support_score": float(annotated["window_support_score"]),
@@ -997,10 +1060,12 @@ class DA3_Streaming:
             "rotation_class_counts": rotation_class_counts,
             "loop_pairs": loop_pairs,
             "ranked_loop_window_count": ranked_loop_window_count,
+            "clustered_loop_window_count": clustered_loop_window_count,
+            "cluster_nms_stats": cluster_nms_stats,
             "loop_window_count": len(serializable_windows),
             "serialized_loop_window_count": len(serializable_windows),
             "unserialized_loop_window_count": max(
-                ranked_loop_window_count - len(exported_loop_results),
+                clustered_loop_window_count - len(exported_loop_results),
                 0,
             ),
             "new_loop_window_count": len(new_windows),
