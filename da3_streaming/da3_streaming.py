@@ -461,6 +461,9 @@ class DA3_Streaming:
             "total_deg": 0.0,
             "peak_deg": 0.0,
             "net_deg": 0.0,
+            "unwrapped_net_deg": 0.0,
+            "principal_net_deg": 0.0,
+            "directionality": 0.0,
             "measured_steps": 0,
         }
 
@@ -490,7 +493,12 @@ class DA3_Streaming:
             "source": "chunk_sim3_path",
             "total_deg": float(total_degrees),
             "peak_deg": float(peak_degrees),
-            "net_deg": self._rotation_angle_degrees(net_rotation),
+            # net_deg is intentionally the unwrapped path displacement, not the
+            # principal SO(3) angle, so a full turn remains near 360 deg.
+            "net_deg": float(np.linalg.norm(cumulative_vector)),
+            "unwrapped_net_deg": float(np.linalg.norm(cumulative_vector)),
+            "principal_net_deg": self._rotation_angle_degrees(net_rotation),
+            "directionality": float(np.linalg.norm(cumulative_vector) / max(total_degrees, 1e-9)),
             "measured_steps": measured_steps,
         }
 
@@ -596,7 +604,13 @@ class DA3_Streaming:
             "source": "camera_pose_path",
             "total_deg": float(total_degrees),
             "peak_deg": float(peak_degrees),
-            "net_deg": float(net_degrees),
+            # net_deg is the unwrapped accumulated camera-path rotation.  Keep
+            # principal_net_deg separately because its SO(3) angle is folded to
+            # 0..180 deg and cannot distinguish full turns from returning.
+            "net_deg": float(np.linalg.norm(cumulative_vector)),
+            "unwrapped_net_deg": float(np.linalg.norm(cumulative_vector)),
+            "principal_net_deg": float(net_degrees),
+            "directionality": float(np.linalg.norm(cumulative_vector) / max(total_degrees, 1e-9)),
             "measured_steps": int(measured_steps),
         }
 
@@ -674,6 +688,9 @@ class DA3_Streaming:
             "path_rotation_total_deg": float(rotation_metrics.get("total_deg", 0.0)),
             "path_rotation_peak_deg": float(rotation_metrics.get("peak_deg", 0.0)),
             "path_rotation_net_deg": float(rotation_metrics.get("net_deg", 0.0)),
+            "path_rotation_unwrapped_net_deg": float(rotation_metrics.get("unwrapped_net_deg", rotation_metrics.get("net_deg", 0.0))),
+            "path_rotation_principal_net_deg": float(rotation_metrics.get("principal_net_deg", rotation_metrics.get("net_deg", 0.0))),
+            "path_rotation_directionality": float(rotation_metrics.get("directionality", 0.0)),
             "path_rotation_measured_steps": int(rotation_metrics.get("measured_steps", 0)),
             "path_rotation_source": rotation_metrics.get("source", "unknown"),
             "rotation_class": rotation_class,
@@ -775,6 +792,9 @@ class DA3_Streaming:
                         "path_rotation_total_deg": float(annotated["path_rotation_total_deg"]),
                         "path_rotation_peak_deg": float(annotated["path_rotation_peak_deg"]),
                         "path_rotation_net_deg": float(annotated["path_rotation_net_deg"]),
+                        "path_rotation_unwrapped_net_deg": float(annotated["path_rotation_unwrapped_net_deg"]),
+                        "path_rotation_principal_net_deg": float(annotated["path_rotation_principal_net_deg"]),
+                        "path_rotation_directionality": float(annotated["path_rotation_directionality"]),
                         "path_rotation_measured_steps": int(annotated["path_rotation_measured_steps"]),
                         "path_rotation_source": annotated["path_rotation_source"],
                         "rotation_class": annotated["rotation_class"],
@@ -806,6 +826,9 @@ class DA3_Streaming:
                 "path_rotation_total_deg": float(annotated["path_rotation_total_deg"]),
                 "path_rotation_peak_deg": float(annotated["path_rotation_peak_deg"]),
                 "path_rotation_net_deg": float(annotated["path_rotation_net_deg"]),
+                "path_rotation_unwrapped_net_deg": float(annotated["path_rotation_unwrapped_net_deg"]),
+                "path_rotation_principal_net_deg": float(annotated["path_rotation_principal_net_deg"]),
+                "path_rotation_directionality": float(annotated["path_rotation_directionality"]),
                 "path_rotation_measured_steps": int(annotated["path_rotation_measured_steps"]),
                 "path_rotation_source": annotated["path_rotation_source"],
                 "rotation_class": annotated["rotation_class"],
