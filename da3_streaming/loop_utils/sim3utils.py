@@ -137,7 +137,35 @@ def apply_sim3_direct(point_maps, s, R, t):
     return transformed
 
 
-def compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t):
+def _sample_correspondences_by_confidence(pts1, pts2, weights, max_pairs, label):
+    if max_pairs is None:
+        return pts1, pts2, weights
+    max_pairs = int(max_pairs)
+    total = int(weights.shape[0])
+    if max_pairs <= 0 or total <= max_pairs:
+        return pts1, pts2, weights
+
+    # Keep the strongest correspondences, then restore input order for reproducible logs.
+    selected = np.argpartition(weights, total - max_pairs)[total - max_pairs :]
+    selected = np.sort(selected)
+    print(
+        f"[Align Sampling] {label}: using {selected.shape[0]} / {total} "
+        "high-confidence correspondences"
+    )
+    return pts1[selected], pts2[selected], weights[selected]
+
+
+def compute_alignment_error(
+    point_map1,
+    conf1,
+    point_map2,
+    conf2,
+    conf_threshold,
+    s,
+    R,
+    t,
+    max_pairs=None,
+):
     """
     Compute the average point alignment error (using only original inputs)
 
@@ -157,6 +185,7 @@ def compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold
 
     target_points = []
     source_points = []
+    confidence_weights = []
 
     for i in range(b):
         mask1 = conf1[i, :h, :w] > conf_threshold
@@ -169,9 +198,11 @@ def compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold
 
         t_pts = point_map1[i, :h, :w][idx]
         s_pts = point_map2[i, :h, :w][idx]
+        combined_conf = np.sqrt(conf1[i, :h, :w][idx] * conf2[i, :h, :w][idx])
 
         target_points.append(t_pts)
         source_points.append(s_pts)
+        confidence_weights.append(combined_conf)
 
     if len(target_points) == 0:
         print("Warning: No matching point pairs found for error calculation")
@@ -179,6 +210,14 @@ def compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold
 
     all_target = np.concatenate(target_points, axis=0)
     all_source = np.concatenate(source_points, axis=0)
+    all_weights = np.concatenate(confidence_weights, axis=0)
+    all_target, all_source, all_weights = _sample_correspondences_by_confidence(
+        all_target,
+        all_source,
+        all_weights,
+        max_pairs,
+        "alignment error",
+    )
 
     transformed = (s * (R @ all_source.T)).T + t
 
@@ -1165,7 +1204,15 @@ def precompute_scale_chunks_with_depth(
 
 
 def weighted_align_point_maps(
-    point_map1, conf1, point_map2, conf2, conf_threshold, config, precompute_scale=None
+    point_map1,
+    conf1,
+    point_map2,
+    conf2,
+    conf_threshold,
+    config,
+    precompute_scale=None,
+    max_pairs=None,
+    error_max_pairs=None,
 ):
     """point_map2 -> point_map1"""
     b1, _, _, _ = point_map1.shape
@@ -1204,7 +1251,15 @@ def weighted_align_point_maps(
     all_pts2 = np.concatenate(aligned_points2, axis=0)
     all_weights = np.concatenate(confidence_weights, axis=0)
 
-    print(f"The number of corresponding points matched: {all_pts1.shape[0]}")
+    total_pairs = all_pts1.shape[0]
+    print(f"The number of corresponding points matched: {total_pairs}")
+    all_pts1, all_pts2, all_weights = _sample_correspondences_by_confidence(
+        all_pts1,
+        all_pts2,
+        all_weights,
+        max_pairs,
+        "Sim3 estimate",
+    )
 
     if config["Model"]["align_lib"] == "numba":
         s, R, t = robust_weighted_estimate_sim3_numba(
@@ -1254,7 +1309,15 @@ def weighted_align_point_maps(
         s = precompute_scale
 
     mean_error = compute_alignment_error(
-        point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t
+        point_map1,
+        conf1,
+        point_map2,
+        conf2,
+        conf_threshold,
+        s,
+        R,
+        t,
+        max_pairs=error_max_pairs,
     )
     print(f"Mean error: {mean_error}")
 

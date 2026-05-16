@@ -14,6 +14,8 @@ Model:
   align_method: 'sim3' # choose among 'sim3', 'se3' or 'scale+se3'
   scale_compute_method: 'auto' # choose among 'auto', 'ransac' or 'weighted'. It is used when align_method == 'scale+se3'
   align_type: 'dense' # choose between 'dense' or 'sparse'. Sparse align is constructing, not avaible for now
+  sequential_align_max_pairs: 500000 # 0 means use all overlap correspondences
+  sequential_align_error_max_pairs: 500000 # 0 means evaluate alignment error on all correspondences
 
   ref_view_strategy: 'saddle_balanced' # 'middle', 'saddle_balanced', 'first' or 'saddle_sim_range'
   ref_view_strategy_loop: 'saddle_balanced' # 'middle', 'saddle_balanced', 'first' or 'saddle_sim_range'

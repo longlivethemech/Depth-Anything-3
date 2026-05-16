@@ -1787,6 +1787,12 @@ class DA3_Streaming:
                 chunk_indices.append((start_idx, end_idx))
         return chunk_indices, num_chunks
 
+    def get_sequential_align_sampling_config(self):
+        model_config = self.config.get("Model", {})
+        max_pairs = int(model_config.get("sequential_align_max_pairs", 0) or 0)
+        error_max_pairs = int(model_config.get("sequential_align_error_max_pairs", max_pairs) or 0)
+        return max_pairs, error_max_pairs
+
     def align_2pcds(
         self,
         point_map1,
@@ -1797,6 +1803,8 @@ class DA3_Streaming:
         chunk2_depth,
         chunk1_depth_conf,
         chunk2_depth_conf,
+        max_pairs=None,
+        error_max_pairs=None,
     ):
 
         conf_threshold = min(np.median(conf1), np.median(conf2)) * 0.1
@@ -1824,6 +1832,8 @@ class DA3_Streaming:
             conf_threshold=conf_threshold,
             config=self.config,
             precompute_scale=scale_factor,
+            max_pairs=max_pairs,
+            error_max_pairs=error_max_pairs,
         )
         print("Estimated Scale:", s)
         print("Estimated Rotation:\n", R)
@@ -2041,6 +2051,7 @@ class DA3_Streaming:
                     chunk1_depth_conf = None
                     chunk2_depth_conf = None
 
+                max_pairs, error_max_pairs = self.get_sequential_align_sampling_config()
                 sequential_align_started = timing_now()
                 s, R, t = self.align_2pcds(
                     point_map1,
@@ -2051,6 +2062,8 @@ class DA3_Streaming:
                     chunk2_depth,
                     chunk1_depth_conf,
                     chunk2_depth_conf,
+                    max_pairs=max_pairs,
+                    error_max_pairs=error_max_pairs,
                 )
                 print_timing(
                     f"da3.process_long_sequence.sequential_chunk_align[{chunk_idx-1}->{chunk_idx}]",
@@ -2296,6 +2309,7 @@ class DA3_Streaming:
                 chunk1_depth_conf = None
                 chunk2_depth_conf = None
 
+            max_pairs, error_max_pairs = self.get_sequential_align_sampling_config()
             sequential_align_started = timing_now()
             s, R, t = self.align_2pcds(
                 point_map1,
@@ -2306,6 +2320,8 @@ class DA3_Streaming:
                 chunk2_depth,
                 chunk1_depth_conf,
                 chunk2_depth_conf,
+                max_pairs=max_pairs,
+                error_max_pairs=error_max_pairs,
             )
             print_timing(
                 f"da3.streaming_chunk.sequential_chunk_align[{chunk_idx-1}->{chunk_idx}]",
