@@ -1793,6 +1793,12 @@ class DA3_Streaming:
         error_max_pairs = int(model_config.get("sequential_align_error_max_pairs", max_pairs) or 0)
         return max_pairs, error_max_pairs
 
+    def get_loop_align_sampling_config(self):
+        model_config = self.config.get("Model", {})
+        max_pairs = int(model_config.get("loop_align_max_pairs", 0) or 0)
+        error_max_pairs = int(model_config.get("loop_align_error_max_pairs", max_pairs) or 0)
+        return max_pairs, error_max_pairs
+
     def align_2pcds(
         self,
         point_map1,
@@ -1843,6 +1849,7 @@ class DA3_Streaming:
 
     def get_loop_sim3_from_loop_predict(self, loop_predict_list):
         loop_sim3_list = []
+        max_pairs, error_max_pairs = self.get_loop_align_sampling_config()
         for item in loop_predict_list:
             chunk_idx_a = item[0][0]
             chunk_idx_b = item[0][2]
@@ -1904,6 +1911,8 @@ class DA3_Streaming:
                 chunk_a_loop_depth,
                 chunk_a_depth_conf,
                 chunk_a_loop_depth_conf,
+                max_pairs=max_pairs,
+                error_max_pairs=error_max_pairs,
             )
 
             print("chunk_b align")
@@ -1946,6 +1955,8 @@ class DA3_Streaming:
                 chunk_b_loop_depth,
                 chunk_b_depth_conf,
                 chunk_b_loop_depth_conf,
+                max_pairs=max_pairs,
+                error_max_pairs=error_max_pairs,
             )
 
             print("a -> b SIM 3")
