@@ -674,15 +674,34 @@ class DA3_Streaming:
         return self._clamp01((float(value) - float(low)) / (float(high) - float(low)))
 
     def _loop_similarity_matrix(self):
-        similarity_matrix = getattr(self.loop_detector, "similarity_matrix", None)
-        if similarity_matrix is not None:
-            return similarity_matrix
         descriptors = getattr(self.loop_detector, "descriptors", None)
         if descriptors is None:
-            return None
+            return getattr(self.loop_detector, "similarity_matrix", None)
         descriptors = descriptors.numpy()
-        similarity_matrix = descriptors @ descriptors.T
+        frame_count = int(descriptors.shape[0])
+        similarity_matrix = getattr(self.loop_detector, "similarity_matrix", None)
+        old_frame_count = int(getattr(self.loop_detector, "full_pair_similarity_frame_count", 0) or 0)
+        can_extend = (
+            similarity_matrix is not None
+            and 0 < old_frame_count <= frame_count
+            and similarity_matrix.shape == (old_frame_count, old_frame_count)
+        )
+        if can_extend and old_frame_count == frame_count:
+            return similarity_matrix
+        if can_extend:
+            next_similarity_matrix = np.empty(
+                (frame_count, frame_count),
+                dtype=descriptors.dtype,
+            )
+            next_similarity_matrix[:old_frame_count, :old_frame_count] = similarity_matrix
+            new_similarity = descriptors[old_frame_count:frame_count] @ descriptors.T
+            next_similarity_matrix[old_frame_count:frame_count, :] = new_similarity
+            next_similarity_matrix[:, old_frame_count:frame_count] = new_similarity.T
+            similarity_matrix = next_similarity_matrix
+        else:
+            similarity_matrix = descriptors @ descriptors.T
         self.loop_detector.similarity_matrix = similarity_matrix
+        self.loop_detector.full_pair_similarity_frame_count = frame_count
         return similarity_matrix
 
     def _window_support_score(self, center_a, center_b, half_window=8):
@@ -700,6 +719,155 @@ class DA3_Streaming:
         if local.size == 0:
             return 0.0
         return self._linear_score(float(np.percentile(local, 90)), 0.60, 0.95)
+
+    def _ensure_streaming_loop_similarity_matrix(self):
+        descriptor_started = timing_now()
+        self.loop_detector.image_paths = None
+        self.loop_detector.extract_descriptors()
+        print_timing("da3.streaming_loop.extract_descriptors", descriptor_started)
+        similarity_started = timing_now()
+        similarity_matrix = self._loop_similarity_matrix()
+        print_timing("da3.streaming_loop.similarity_matrix", similarity_started)
+        return similarity_matrix
+
+    def _chunk_frame_indices_for_similarity(self, chunk_idx, frame_count):
+        if chunk_idx < 0 or chunk_idx >= len(self.chunk_indices):
+            return np.asarray([], dtype=np.int64)
+        start, end = self.chunk_indices[chunk_idx]
+        start = max(int(start), 0)
+        end = min(int(end), int(frame_count))
+        if start >= end:
+            return np.asarray([], dtype=np.int64)
+        frames = np.arange(start, end, dtype=np.int64)
+        return np.asarray(
+            [frame for frame in frames if self._frame_chunk_index(frame) == int(chunk_idx)],
+            dtype=np.int64,
+        )
+
+    def _select_block_similarity_peaks(
+        self,
+        source_frames,
+        target_frames,
+        similarity_block,
+        min_frame_gap=0,
+        topk=1,
+        peak_nms_radius=10,
+        min_similarity=0.0,
+    ):
+        if similarity_block.size == 0 or topk <= 0:
+            return []
+        source_grid = source_frames[:, None]
+        target_grid = target_frames[None, :]
+        valid_mask = np.abs(source_grid - target_grid) >= int(min_frame_gap)
+        if min_similarity > 0.0:
+            valid_mask &= similarity_block >= float(min_similarity)
+        if not np.any(valid_mask):
+            return []
+
+        valid_positions = np.argwhere(valid_mask)
+        valid_scores = similarity_block[valid_mask]
+        order = np.argsort(valid_scores)[::-1]
+        selected = []
+        for order_idx in order:
+            local_source_idx, local_target_idx = valid_positions[int(order_idx)]
+            frame_a = int(source_frames[int(local_source_idx)])
+            frame_b = int(target_frames[int(local_target_idx)])
+            similarity = float(valid_scores[int(order_idx)])
+            too_close = False
+            for kept_a, kept_b, _ in selected:
+                if (
+                    abs(frame_a - int(kept_a)) <= int(peak_nms_radius)
+                    and abs(frame_b - int(kept_b)) <= int(peak_nms_radius)
+                ):
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            selected.append((frame_a, frame_b, similarity))
+            if len(selected) >= int(topk):
+                break
+        return selected
+
+    def _chunk_pair_block_loop_candidates(
+        self,
+        chunk_idx,
+        min_chunk_gap=0,
+        min_frame_gap=0,
+        lookback_chunks=0,
+        topk_per_chunk_pair=1,
+        peak_nms_radius=10,
+        min_similarity=0.0,
+    ):
+        similarity_matrix = self._ensure_streaming_loop_similarity_matrix()
+        if similarity_matrix is None:
+            return [], {
+                "mode": "chunk_pair_block_search",
+                "reason": "missing_similarity_matrix",
+            }
+
+        frame_count = int(similarity_matrix.shape[0])
+        processed_chunk_count = len(self.chunk_indices)
+        source_chunks = []
+        for source_chunk in range(
+            int(chunk_idx),
+            max(int(chunk_idx) - int(lookback_chunks), 0) - 1,
+            -1,
+        ):
+            if 0 <= source_chunk < processed_chunk_count and source_chunk not in source_chunks:
+                source_chunks.append(source_chunk)
+
+        selected_pairs = []
+        chunk_pair_count = 0
+        block_frame_pair_count = 0
+        similarity_suppressed_count = 0
+        empty_block_count = 0
+        for source_chunk in source_chunks:
+            source_frames = self._chunk_frame_indices_for_similarity(source_chunk, frame_count)
+            if source_frames.size == 0:
+                continue
+            for target_chunk in range(0, source_chunk):
+                chunk_gap = abs(int(source_chunk) - int(target_chunk))
+                if chunk_gap < int(min_chunk_gap):
+                    continue
+                target_frames = self._chunk_frame_indices_for_similarity(target_chunk, frame_count)
+                if target_frames.size == 0:
+                    empty_block_count += 1
+                    continue
+                chunk_pair_count += 1
+                block_frame_pair_count += int(source_frames.size * target_frames.size)
+                similarity_block = similarity_matrix[np.ix_(source_frames, target_frames)]
+                peaks = self._select_block_similarity_peaks(
+                    source_frames,
+                    target_frames,
+                    similarity_block,
+                    min_frame_gap=min_frame_gap,
+                    topk=topk_per_chunk_pair,
+                    peak_nms_radius=peak_nms_radius,
+                    min_similarity=min_similarity,
+                )
+                if not peaks:
+                    similarity_suppressed_count += 1
+                    continue
+                selected_pairs.extend(peaks)
+
+        selected_pairs.sort(key=lambda x: x[2], reverse=True)
+        return selected_pairs, {
+            "mode": "chunk_pair_block_search",
+            "source_chunks": [int(c) for c in source_chunks],
+            "processed_chunk_count": int(processed_chunk_count),
+            "frame_count": int(frame_count),
+            "chunk_pair_count": int(chunk_pair_count),
+            "block_frame_pair_count": int(block_frame_pair_count),
+            "selected_pair_count": int(len(selected_pairs)),
+            "similarity_suppressed_chunk_pair_count": int(similarity_suppressed_count),
+            "empty_block_count": int(empty_block_count),
+            "min_chunk_gap": int(min_chunk_gap),
+            "min_frame_gap": int(min_frame_gap),
+            "lookback_chunks": int(lookback_chunks),
+            "topk_per_chunk_pair": int(topk_per_chunk_pair),
+            "peak_nms_radius": int(peak_nms_radius),
+            "min_similarity": float(min_similarity),
+        }
 
     def _loop_priority_components(
         self,
@@ -945,14 +1113,71 @@ class DA3_Streaming:
             float(self.config["Loop"]["SALAD"].get("correction_min_priority", 0.0)),
             0.0,
         )
+        streaming_candidate_mode = str(
+            self.config["Loop"]["SALAD"].get(
+                "streaming_candidate_mode",
+                "full_pair_closures",
+            )
+        )
 
         self.loop_detector.image_paths = None
         self.loop_detector.loop_closures = None
-
-        self.loop_list = self.get_streaming_loop_closures(
-            chunk_idx=chunk_idx,
-            lookback_chunks=lookback_chunks,
-        )
+        loop_pair_block_stats = {}
+        if streaming_candidate_mode == "chunk_pair_block_search":
+            self.loop_detector.raw_loop_closures = []
+            self.loop_detector.new_loop_closures = []
+            block_search_started = timing_now()
+            self.loop_list, loop_pair_block_stats = self._chunk_pair_block_loop_candidates(
+                chunk_idx=chunk_idx,
+                min_chunk_gap=min_chunk_gap,
+                min_frame_gap=min_frame_gap,
+                lookback_chunks=lookback_chunks,
+                topk_per_chunk_pair=max(
+                    int(
+                        self.config["Loop"]["SALAD"].get(
+                            "streaming_block_topk_per_chunk_pair",
+                            1,
+                        )
+                    ),
+                    1,
+                ),
+                peak_nms_radius=max(
+                    int(
+                        self.config["Loop"]["SALAD"].get(
+                            "streaming_block_peak_nms_radius",
+                            10,
+                        )
+                    ),
+                    0,
+                ),
+                min_similarity=max(
+                    float(
+                        self.config["Loop"]["SALAD"].get(
+                            "streaming_block_min_similarity",
+                            0.0,
+                        )
+                    ),
+                    0.0,
+                ),
+            )
+            loop_pair_block_stats["wall_sec"] = print_timing(
+                "da3.streaming_loop.chunk_pair_block_search",
+                block_search_started,
+            )
+            self.loop_detector.loop_closures = list(self.loop_list)
+            self.loop_detector.nms_stats = {
+                "mode": "chunk_pair_block_search",
+                "selected_pair_count": len(self.loop_list),
+                "min_chunk_gap": int(min_chunk_gap),
+                "min_frame_gap": int(min_frame_gap),
+                "lookback_chunks": int(lookback_chunks),
+            }
+            self.streaming_loop_last_lookback_stats = {}
+        else:
+            self.loop_list = self.get_streaming_loop_closures(
+                chunk_idx=chunk_idx,
+                lookback_chunks=lookback_chunks,
+            )
         loop_pair_lookback_stats = getattr(self, "streaming_loop_last_lookback_stats", {})
         loop_pair_count_before_chunk_gap_filter = len(self.loop_list)
         chunk_gap_pair_suppressed_count = 0
@@ -1204,6 +1429,8 @@ class DA3_Streaming:
             "loop_pair_count": len(loop_pairs),
             "loop_nms_stats": loop_nms_stats,
             "loop_pair_lookback_stats": loop_pair_lookback_stats,
+            "streaming_candidate_mode": streaming_candidate_mode,
+            "loop_pair_block_stats": loop_pair_block_stats,
             "rotation_aware_priority": True,
             "rotation_class_counts": rotation_class_counts,
             "loop_pairs": loop_pairs,
