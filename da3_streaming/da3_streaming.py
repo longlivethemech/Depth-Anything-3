@@ -1513,11 +1513,18 @@ class DA3_Streaming:
         optimize_sec = print_timing("da3.streaming_loop.optimize", optimize_started)
         optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
         self.streaming_map_epoch += 1
-        self.plot_loop_closure(
-            input_abs_poses,
-            optimized_abs_poses,
-            save_name=f"streaming_sim3_opt_epoch_{self.streaming_map_epoch}.png",
-        )
+        plot_sec = 0.0
+        plot_path = None
+        if bool(self.config["Loop"]["SALAD"].get("streaming_loop_plot_correction", False)):
+            plot_started = timing_now()
+            plot_name = f"streaming_sim3_opt_epoch_{self.streaming_map_epoch}.png"
+            self.plot_loop_closure(
+                input_abs_poses,
+                optimized_abs_poses,
+                save_name=plot_name,
+            )
+            plot_sec = print_timing("da3.streaming_loop.plot_loop_closure", plot_started)
+            plot_path = os.path.join(self.output_dir, plot_name)
 
         info = {
             "enabled": True,
@@ -1528,6 +1535,8 @@ class DA3_Streaming:
             "total_loop_sim3_count": len(self.loop_sim3_list),
             "optimized_sequential_transform_count": len(self.sim3_list),
             "optimize_sec": optimize_sec,
+            "plot_sec": plot_sec,
+            "plot_path": plot_path,
             "wall_sec": print_timing("da3.streaming_loop.correction_total", correction_started),
         }
         output_path = os.path.join(
@@ -2275,19 +2284,37 @@ class DA3_Streaming:
                 loop_info["loop_detection_interval"] = loop_detection_interval
                 loop_info["loop_detection_lookback_chunks"] = loop_lookback_chunks
 
-        artifacts = self.export_streaming_chunk_artifacts(
-            chunk_idx,
-            map_epoch=self.streaming_map_epoch,
-            map_mode="corrected" if self.streaming_map_epoch else "provisional",
-        )
+        corrected_chunk_artifacts = None
+        if correction_info is not None and reexport_corrected_chunks:
+            corrected_chunk_artifacts = self.export_streaming_corrected_chunk_artifacts(
+                correction_info["map_epoch"]
+            )
+            artifacts = next(
+                (
+                    corrected
+                    for corrected in corrected_chunk_artifacts
+                    if int(corrected.get("chunk_index", -1)) == int(chunk_idx)
+                ),
+                None,
+            )
+            if artifacts is None:
+                artifacts = self.export_streaming_chunk_artifacts(
+                    chunk_idx,
+                    map_epoch=self.streaming_map_epoch,
+                    map_mode="corrected",
+                )
+        else:
+            artifacts = self.export_streaming_chunk_artifacts(
+                chunk_idx,
+                map_epoch=self.streaming_map_epoch,
+                map_mode="corrected" if self.streaming_map_epoch else "provisional",
+            )
         if loop_info is not None:
             artifacts["streaming_loop_detection"] = loop_info
         if correction_info is not None:
             artifacts["streaming_loop_correction"] = correction_info
-            if reexport_corrected_chunks:
-                artifacts["streaming_loop_corrected_chunks"] = (
-                    self.export_streaming_corrected_chunk_artifacts(correction_info["map_epoch"])
-                )
+            if corrected_chunk_artifacts is not None:
+                artifacts["streaming_loop_corrected_chunks"] = corrected_chunk_artifacts
         print_timing(
             f"da3.process_streaming_chunk.total[{chunk_idx}]",
             streaming_chunk_started,
