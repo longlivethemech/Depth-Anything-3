@@ -47,6 +47,8 @@ Loop:
     streaming_block_topk_per_chunk_pair: 2
     streaming_block_peak_nms_radius: 10
     streaming_block_min_similarity: 0.60
+    streaming_viewer_npz_enabled: True
+    streaming_skip_ply_export: True
     streaming_loop_plot_correction: False
     max_serialized_windows: 500
     streaming_incremental_lookback_chunks: -1

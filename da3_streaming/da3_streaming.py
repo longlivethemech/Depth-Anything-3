@@ -386,6 +386,7 @@ class DA3_Streaming:
         self.streaming_loop_correction_seen_chunk_pairs = set()
         self.streaming_loop_correction_pending_windows = []
         self.streaming_map_epoch = 0
+        self.streaming_last_corrected_export_chunk_idx = -10**9
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
 
@@ -1505,12 +1506,18 @@ class DA3_Streaming:
         self.loop_sim3_list.extend(new_loop_sim3)
         print_timing("da3.streaming_loop.get_new_loop_sim3", get_loop_sim3_started)
 
+        before_accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
         input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
         optimize_started = timing_now()
         self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
         optimize_sec = print_timing("da3.streaming_loop.optimize", optimize_started)
+        after_accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
+        transform_updates = self._streaming_loop_transform_updates(
+            before_accumulated_sim3,
+            after_accumulated_sim3,
+        )
         optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
         self.streaming_map_epoch += 1
         plot_sec = 0.0
@@ -1534,6 +1541,8 @@ class DA3_Streaming:
             "new_loop_sim3_count": len(new_loop_sim3),
             "total_loop_sim3_count": len(self.loop_sim3_list),
             "optimized_sequential_transform_count": len(self.sim3_list),
+            "transform_update_count": len(transform_updates),
+            "transform_updates": transform_updates,
             "optimize_sec": optimize_sec,
             "plot_sec": plot_sec,
             "plot_path": plot_path,
@@ -1640,6 +1649,67 @@ class DA3_Streaming:
             chunk_data.extrinsics,
         )
         return apply_sim3_direct_torch(world_points, s, R, t)
+
+    def _streaming_confident_sampled_points(self, points, colors, confs, *, chunk_idx, map_epoch=0):
+        points = points.reshape(-1, 3).astype(np.float32, copy=False)
+        colors = colors.reshape(-1, 3).astype(np.uint8, copy=False)
+        confs = confs.reshape(-1).astype(np.float32, copy=False)
+        mask = (confs >= self._pointcloud_conf_threshold(confs)) & (confs > 1e-5)
+        points = points[mask]
+        colors = colors[mask]
+        sample_ratio = float(self.config["Model"]["Pointcloud_Save"]["sample_ratio"])
+        if 0.0 < sample_ratio < 1.0 and len(points) > 0:
+            sample_count = max(1, int(len(points) * sample_ratio))
+            seed = (int(map_epoch) + 1) * 1000003 + int(chunk_idx) * 9176 + len(points)
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(len(points), sample_count, replace=False)
+            points = points[indices]
+            colors = colors[indices]
+        return points, colors
+
+    def _absolute_chunk_sim3(self, accumulated_sim3, chunk_idx):
+        if int(chunk_idx) <= 0:
+            return (
+                1.0,
+                np.eye(3, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),
+            )
+        s, R, t = accumulated_sim3[int(chunk_idx) - 1]
+        return (
+            float(np.asarray(s).reshape(-1)[0]),
+            np.asarray(R, dtype=np.float64).reshape(3, 3),
+            np.asarray(t, dtype=np.float64).reshape(3),
+        )
+
+    def _chunk_transform_update(self, before_accumulated_sim3, after_accumulated_sim3, chunk_idx):
+        before_s, before_R, before_t = self._absolute_chunk_sim3(before_accumulated_sim3, chunk_idx)
+        after_s, after_R, after_t = self._absolute_chunk_sim3(after_accumulated_sim3, chunk_idx)
+        scale = after_s / max(before_s, 1e-12)
+        rotation = after_R @ before_R.T
+        translation = after_t - scale * (rotation @ before_t)
+        return {
+            "chunk_index": int(chunk_idx),
+            "scale": float(scale),
+            "rotation": rotation.astype(float).tolist(),
+            "translation": translation.astype(float).tolist(),
+        }
+
+    def _streaming_loop_transform_updates(self, before_accumulated_sim3, after_accumulated_sim3):
+        updates = []
+        for chunk_idx in range(len(self.chunk_indices)):
+            update = self._chunk_transform_update(
+                before_accumulated_sim3,
+                after_accumulated_sim3,
+                chunk_idx,
+            )
+            if (
+                abs(update["scale"] - 1.0) < 1e-9
+                and np.max(np.abs(np.asarray(update["rotation"]) - np.eye(3))) < 1e-9
+                and np.max(np.abs(np.asarray(update["translation"]))) < 1e-9
+            ):
+                continue
+            updates.append(update)
+        return updates
 
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
         chunk_total_started = timing_now()
@@ -2170,6 +2240,8 @@ class DA3_Streaming:
         loop_detection_interval=1,
         loop_correction_min_new_windows=2,
         reexport_corrected_chunks=True,
+        corrected_export_min_chunk_gap=2,
+        corrected_export_workers=1,
     ):
         streaming_chunk_started = timing_now()
         if self.overlap >= self.chunk_size:
@@ -2293,10 +2365,32 @@ class DA3_Streaming:
             artifacts["streaming_loop_detection"] = loop_info
         if correction_info is not None:
             artifacts["streaming_loop_correction"] = correction_info
-            if reexport_corrected_chunks:
-                artifacts["streaming_loop_corrected_chunks"] = (
-                    self.export_streaming_corrected_chunk_artifacts(correction_info["map_epoch"])
+            transform_updates = correction_info.get("transform_updates")
+            if transform_updates:
+                # The current chunk artifact is exported after correction, so it
+                # is already in the corrected frame. Only previously rendered
+                # chunks need an incremental viewer transform.
+                artifacts["streaming_loop_transform_updates"] = [
+                    update
+                    for update in transform_updates
+                    if int(update.get("chunk_index", -1)) < chunk_idx
+                ]
+            corrected_export_min_chunk_gap = max(int(corrected_export_min_chunk_gap), 0)
+            should_export_corrected_chunks = (
+                reexport_corrected_chunks
+                and (
+                    chunk_idx - int(self.streaming_last_corrected_export_chunk_idx)
+                    >= corrected_export_min_chunk_gap
                 )
+            )
+            if should_export_corrected_chunks:
+                artifacts["streaming_loop_corrected_chunks"] = (
+                    self.export_streaming_corrected_chunk_artifacts(
+                        correction_info["map_epoch"],
+                        max_workers=corrected_export_workers,
+                    )
+                )
+                self.streaming_last_corrected_export_chunk_idx = chunk_idx
         print_timing(
             f"da3.process_streaming_chunk.total[{chunk_idx}]",
             streaming_chunk_started,
@@ -2328,15 +2422,42 @@ class DA3_Streaming:
         points = world_points.reshape(-1, 3)
         colors = (chunk_data.processed_images.reshape(-1, 3)).astype(np.uint8)
         confs = chunk_data.conf.reshape(-1)
-        ply_path = os.path.join(self.pcd_dir, f"{path_tag}_pcd.ply")
-        save_confident_pointcloud_batch(
-            points=points,
-            colors=colors,
-            confs=confs,
-            output_path=ply_path,
-            conf_threshold=self._pointcloud_conf_threshold(confs),
-            sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-        )
+        loop_cfg = self.config.get("Loop", {}).get("SALAD", {})
+        map_epoch_for_sample = int(map_epoch) if map_epoch is not None else int(self.streaming_map_epoch)
+        viewer_geometry_npz_path = None
+        sampled_point_count = None
+        if bool(loop_cfg.get("streaming_viewer_npz_enabled", True)):
+            sample_started = timing_now()
+            sampled_points, sampled_colors = self._streaming_confident_sampled_points(
+                points,
+                colors,
+                confs,
+                chunk_idx=chunk_idx,
+                map_epoch=map_epoch_for_sample,
+            )
+            viewer_geometry_npz_path = os.path.join(
+                self.output_dir,
+                f"viewer_geometry_chunk_{path_tag}.npz",
+            )
+            np.savez(
+                viewer_geometry_npz_path,
+                positions=sampled_points.astype(np.float32, copy=False),
+                colors=sampled_colors.astype(np.uint8, copy=False),
+            )
+            sampled_point_count = int(len(sampled_points))
+            print_timing(f"da3.export_streaming_viewer_npz[{chunk_idx}]", sample_started)
+
+        ply_path = None
+        if not bool(loop_cfg.get("streaming_skip_ply_export", True)):
+            ply_path = os.path.join(self.pcd_dir, f"{path_tag}_pcd.ply")
+            save_confident_pointcloud_batch(
+                points=points,
+                colors=colors,
+                confs=confs,
+                output_path=ply_path,
+                conf_threshold=self._pointcloud_conf_threshold(confs),
+                sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+            )
 
         camera_poses_path = os.path.join(self.output_dir, f"camera_poses_chunk_{path_tag}.txt")
         intrinsic_path = os.path.join(self.output_dir, f"intrinsic_chunk_{path_tag}.txt")
@@ -2353,6 +2474,8 @@ class DA3_Streaming:
             "chunk_index": chunk_idx,
             "chunk_range": self.chunk_indices[chunk_idx],
             "pcd": ply_path,
+            "viewer_geometry_npz": viewer_geometry_npz_path,
+            "viewer_geometry_point_count": sampled_point_count,
             "camera_poses": camera_poses_path,
             "intrinsic": intrinsic_path,
             "processed_chunk_count": len(self.chunk_indices),
@@ -2362,20 +2485,30 @@ class DA3_Streaming:
             "requires_map_replace": False,
         }
 
-    def export_streaming_corrected_chunk_artifacts(self, map_epoch):
+    def export_streaming_corrected_chunk_artifacts(self, map_epoch, max_workers=1):
         corrected_started = timing_now()
         accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
-        corrected_chunks = []
-        for chunk_idx in range(len(self.chunk_indices)):
-            corrected_chunks.append(
-                self.export_streaming_chunk_artifacts(
-                    chunk_idx,
-                    accumulated_sim3=accumulated_sim3,
-                    artifact_tag=f"epoch_{int(map_epoch)}_chunk_{chunk_idx}",
-                    map_epoch=map_epoch,
-                    map_mode="corrected",
-                )
+        chunk_indices = list(range(len(self.chunk_indices)))
+
+        def export_one(chunk_idx):
+            return self.export_streaming_chunk_artifacts(
+                chunk_idx,
+                accumulated_sim3=accumulated_sim3,
+                artifact_tag=f"epoch_{int(map_epoch)}_chunk_{chunk_idx}",
+                map_epoch=map_epoch,
+                map_mode="corrected",
             )
+
+        worker_count = max(1, min(int(max_workers), len(chunk_indices) or 1))
+        if worker_count <= 1 or len(chunk_indices) <= 1:
+            corrected_chunks = [export_one(chunk_idx) for chunk_idx in chunk_indices]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                corrected_chunks = list(pool.map(export_one, chunk_indices))
+        print(
+            "[streaming_loop] exported corrected chunks "
+            f"count={len(corrected_chunks)} workers={worker_count}"
+        )
         print_timing("da3.streaming_loop.export_corrected_chunks", corrected_started)
         return corrected_chunks
 
@@ -2456,6 +2589,7 @@ class DA3_Streaming:
         self.streaming_loop_correction_seen_chunk_pairs = set()
         self.streaming_loop_correction_pending_windows = []
         self.streaming_map_epoch = 0
+        self.streaming_last_corrected_export_chunk_idx = -10**9
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
         self.skyseg_session = None
