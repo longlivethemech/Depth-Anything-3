@@ -155,6 +155,21 @@ def _sample_correspondences_by_confidence(pts1, pts2, weights, max_pairs, label)
     return pts1[selected], pts2[selected], weights[selected]
 
 
+def _spatial_stride_for_pair_budget(batch_size, height, width, max_pairs):
+    if max_pairs is None:
+        return 1
+    max_pairs = int(max_pairs)
+    if max_pairs <= 0:
+        return 1
+    total_pixels = int(batch_size) * int(height) * int(width)
+    if total_pixels <= max_pairs:
+        return 1
+
+    # Floor keeps us near the requested pair budget; the confidence pass can trim the rest.
+    stride = int(np.floor(np.sqrt(total_pixels / max_pairs)))
+    return max(1, stride)
+
+
 def compute_alignment_error(
     point_map1,
     conf1,
@@ -182,23 +197,31 @@ def compute_alignment_error(
     b = min(b1, b2)
     h = min(h1, h2)
     w = min(w1, w2)
+    spatial_stride = _spatial_stride_for_pair_budget(b, h, w, max_pairs)
+    if spatial_stride > 1:
+        print(f"[Align Sampling] alignment error: spatial stride {spatial_stride}")
 
     target_points = []
     source_points = []
     confidence_weights = []
 
     for i in range(b):
-        mask1 = conf1[i, :h, :w] > conf_threshold
-        mask2 = conf2[i, :h, :w] > conf_threshold
+        point_slice1 = point_map1[i, :h:spatial_stride, :w:spatial_stride]
+        point_slice2 = point_map2[i, :h:spatial_stride, :w:spatial_stride]
+        conf_slice1 = conf1[i, :h:spatial_stride, :w:spatial_stride]
+        conf_slice2 = conf2[i, :h:spatial_stride, :w:spatial_stride]
+
+        mask1 = conf_slice1 > conf_threshold
+        mask2 = conf_slice2 > conf_threshold
         valid_mask = mask1 & mask2
 
         idx = np.where(valid_mask)
         if len(idx[0]) == 0:
             continue
 
-        t_pts = point_map1[i, :h, :w][idx]
-        s_pts = point_map2[i, :h, :w][idx]
-        combined_conf = np.sqrt(conf1[i, :h, :w][idx] * conf2[i, :h, :w][idx])
+        t_pts = point_slice1[idx]
+        s_pts = point_slice2[idx]
+        combined_conf = np.sqrt(conf_slice1[idx] * conf_slice2[idx])
 
         target_points.append(t_pts)
         source_points.append(s_pts)
@@ -1215,9 +1238,14 @@ def weighted_align_point_maps(
     error_max_pairs=None,
 ):
     """point_map2 -> point_map1"""
-    b1, _, _, _ = point_map1.shape
-    b2, _, _, _ = point_map2.shape
+    b1, h1, w1, _ = point_map1.shape
+    b2, h2, w2, _ = point_map2.shape
     b = min(b1, b2)
+    h = min(h1, h2)
+    w = min(w1, w2)
+    spatial_stride = _spatial_stride_for_pair_budget(b, h, w, max_pairs)
+    if spatial_stride > 1:
+        print(f"[Align Sampling] Sim3 estimate: spatial stride {spatial_stride}")
 
     if precompute_scale is not None:  # meaning we are using align method 'scale+se3'
         point_map2 *= precompute_scale
@@ -1227,18 +1255,23 @@ def weighted_align_point_maps(
     confidence_weights = []
 
     for i in range(b):
-        mask1 = conf1[i] > conf_threshold
-        mask2 = conf2[i] > conf_threshold
+        point_slice1 = point_map1[i, :h:spatial_stride, :w:spatial_stride]
+        point_slice2 = point_map2[i, :h:spatial_stride, :w:spatial_stride]
+        conf_slice1 = conf1[i, :h:spatial_stride, :w:spatial_stride]
+        conf_slice2 = conf2[i, :h:spatial_stride, :w:spatial_stride]
+
+        mask1 = conf_slice1 > conf_threshold
+        mask2 = conf_slice2 > conf_threshold
         valid_mask = mask1 & mask2
 
         idx = np.where(valid_mask)
         if len(idx[0]) == 0:
             continue
 
-        pts1 = point_map1[i][idx]
-        pts2 = point_map2[i][idx]
+        pts1 = point_slice1[idx]
+        pts2 = point_slice2[idx]
 
-        combined_conf = np.sqrt(conf1[i][idx] * conf2[i][idx])
+        combined_conf = np.sqrt(conf_slice1[idx] * conf_slice2[idx])
 
         aligned_points1.append(pts1)
         aligned_points2.append(pts2)
