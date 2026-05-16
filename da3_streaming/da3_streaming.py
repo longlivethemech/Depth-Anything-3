@@ -420,11 +420,47 @@ class DA3_Streaming:
         print_timing("da3.loop.get_loop_pairs_total", loop_pairs_started)
         return loop_list
 
-    def get_streaming_loop_closures(self):
+    def get_streaming_loop_closures(self, chunk_idx=None, lookback_chunks=0):
         loop_pairs_started = timing_now()
         self.loop_detector.run(save_results=False, incremental_only=True)
         print_timing("da3.streaming_loop.loop_detector_run_incremental", loop_pairs_started)
         closures = list(getattr(self.loop_detector, "loop_closures", None) or [])
+        lookback_stats = {
+            "enabled": False,
+            "chunk_idx": int(chunk_idx) if chunk_idx is not None else None,
+            "lookback_chunks": int(max(int(lookback_chunks), 0)),
+            "lookback_chunk_indices": [],
+            "incremental_pair_count": len(closures),
+            "raw_pair_count": len(getattr(self.loop_detector, "raw_loop_closures", None) or []),
+            "added_pair_count": 0,
+            "merged_pair_count": len(closures),
+        }
+        if chunk_idx is not None and int(lookback_chunks) > 0:
+            start_chunk = max(0, int(chunk_idx) - int(lookback_chunks))
+            lookback_chunk_indices = set(range(start_chunk, int(chunk_idx)))
+            lookback_stats["enabled"] = bool(lookback_chunk_indices)
+            lookback_stats["lookback_chunk_indices"] = sorted(int(v) for v in lookback_chunk_indices)
+            if lookback_chunk_indices:
+                merged = {}
+                for closure in closures:
+                    if len(closure) < 2:
+                        continue
+                    key = tuple(sorted((int(closure[0]), int(closure[1]))))
+                    merged[key] = closure
+                for closure in getattr(self.loop_detector, "raw_loop_closures", None) or []:
+                    if len(closure) < 2:
+                        continue
+                    key = tuple(sorted((int(closure[0]), int(closure[1]))))
+                    if key in merged:
+                        continue
+                    chunk_a = self._frame_chunk_index(int(closure[0]))
+                    chunk_b = self._frame_chunk_index(int(closure[1]))
+                    if chunk_a in lookback_chunk_indices or chunk_b in lookback_chunk_indices:
+                        merged[key] = closure
+                closures = sorted(merged.values(), key=lambda item: float(item[2]), reverse=True)
+                lookback_stats["added_pair_count"] = len(closures) - lookback_stats["incremental_pair_count"]
+                lookback_stats["merged_pair_count"] = len(closures)
+        self.streaming_loop_last_lookback_stats = lookback_stats
         print_timing("da3.streaming_loop.get_loop_closures_total", loop_pairs_started)
         return closures
 
@@ -867,6 +903,7 @@ class DA3_Streaming:
         min_chunk_gap=0,
         min_frame_gap=0,
         max_new_windows=0,
+        lookback_chunks=0,
     ):
         loop_detection_started = timing_now()
         if not self.loop_enable:
@@ -912,7 +949,11 @@ class DA3_Streaming:
         self.loop_detector.image_paths = None
         self.loop_detector.loop_closures = None
 
-        self.loop_list = self.get_streaming_loop_closures()
+        self.loop_list = self.get_streaming_loop_closures(
+            chunk_idx=chunk_idx,
+            lookback_chunks=lookback_chunks,
+        )
+        loop_pair_lookback_stats = getattr(self, "streaming_loop_last_lookback_stats", {})
         loop_pair_count_before_chunk_gap_filter = len(self.loop_list)
         chunk_gap_pair_suppressed_count = 0
         if min_chunk_gap > 0:
@@ -945,6 +986,35 @@ class DA3_Streaming:
             loop_pairs_for_windows,
             half_window=int(self.config["Model"]["loop_chunk_size"] / 2),
         )
+        best_loop_pair_by_window_key = {}
+        loop_pair_window_dedup_suppressed_count = 0
+        for item, loop_pair in zip(loop_results, self.loop_list):
+            chunk_a = int(item[0])
+            range_a = (int(item[1][0]), int(item[1][1]))
+            chunk_b = int(item[2])
+            range_b = (int(item[3][0]), int(item[3][1]))
+            center_a = (range_a[0] + range_a[1]) // 2
+            center_b = (range_b[0] + range_b[1]) // 2
+            chunk_gap = abs(chunk_a - chunk_b)
+            frame_gap = abs(center_a - center_b)
+            if chunk_gap < min_chunk_gap or frame_gap < min_frame_gap:
+                continue
+            key = (
+                chunk_a,
+                int(range_a[0]),
+                int(range_a[1]),
+                chunk_b,
+                int(range_b[0]),
+                int(range_b[1]),
+            )
+            similarity = float(loop_pair[2]) if len(loop_pair) >= 3 else 0.0
+            existing = best_loop_pair_by_window_key.get(key)
+            if existing is None or similarity > float(existing[1][2]):
+                if existing is not None:
+                    loop_pair_window_dedup_suppressed_count += 1
+                best_loop_pair_by_window_key[key] = (item, loop_pair)
+            else:
+                loop_pair_window_dedup_suppressed_count += 1
         annotated_by_key = {}
         gap_prefilter_suppressed_count = 0
         priority_prefilter_suppressed_count = 0
@@ -960,6 +1030,7 @@ class DA3_Streaming:
             if chunk_gap < min_chunk_gap or frame_gap < min_frame_gap:
                 gap_prefilter_suppressed_count += 1
                 continue
+        for item, loop_pair in best_loop_pair_by_window_key.values():
             annotated = self._annotate_streaming_loop_window(
                 item,
                 loop_pair_scores,
@@ -1132,6 +1203,7 @@ class DA3_Streaming:
             "raw_loop_pair_count": len(raw_loop_pairs),
             "loop_pair_count": len(loop_pairs),
             "loop_nms_stats": loop_nms_stats,
+            "loop_pair_lookback_stats": loop_pair_lookback_stats,
             "rotation_aware_priority": True,
             "rotation_class_counts": rotation_class_counts,
             "loop_pairs": loop_pairs,
@@ -1142,6 +1214,7 @@ class DA3_Streaming:
             "clustered_loop_window_count": clustered_loop_window_count,
             "cluster_nms_stats": cluster_nms_stats,
             "gap_prefilter_suppressed_count": gap_prefilter_suppressed_count,
+            "loop_pair_window_dedup_suppressed_count": loop_pair_window_dedup_suppressed_count,
             "priority_prefilter_suppressed_count": priority_prefilter_suppressed_count,
             "loop_window_count": len(serializable_windows),
             "serialized_loop_window_count": len(serializable_windows),
@@ -1159,6 +1232,7 @@ class DA3_Streaming:
             "rejected_loop_windows": rejected_windows,
             "min_chunk_gap": min_chunk_gap,
             "min_frame_gap": min_frame_gap,
+            "lookback_chunks": int(max(int(lookback_chunks), 0)),
             "max_new_windows": max_new_windows,
             "max_serialized_windows": max_serialized_windows,
             "loop_windows": serializable_windows,
@@ -1941,11 +2015,20 @@ class DA3_Streaming:
             and chunk_idx % loop_detection_interval == 0
         )
         if should_run_loop_detection:
+            configured_lookback_chunks = int(
+                self.config["Loop"]["SALAD"].get("streaming_incremental_lookback_chunks", -1)
+            )
+            loop_lookback_chunks = (
+                max(configured_lookback_chunks, 0)
+                if configured_lookback_chunks >= 0
+                else max(loop_detection_interval - 1, 0)
+            )
             loop_info = self.detect_streaming_loop_candidates(
                 chunk_idx,
                 min_chunk_gap=loop_min_chunk_gap,
                 min_frame_gap=loop_min_frame_gap,
                 max_new_windows=loop_max_new_windows,
+                lookback_chunks=loop_lookback_chunks,
             )
             new_loop_windows = loop_info.get("new_loop_windows") or []
             if enable_loop_correction and new_loop_windows:
@@ -1963,6 +2046,7 @@ class DA3_Streaming:
                 loop_info["pending_loop_window_count"] = len(self.streaming_loop_correction_pending_windows)
                 loop_info["correction_min_new_windows"] = max(int(loop_correction_min_new_windows), 1)
                 loop_info["loop_detection_interval"] = loop_detection_interval
+                loop_info["loop_detection_lookback_chunks"] = loop_lookback_chunks
 
         artifacts = self.export_streaming_chunk_artifacts(
             chunk_idx,
