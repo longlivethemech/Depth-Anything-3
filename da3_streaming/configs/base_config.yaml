@@ -24,6 +24,7 @@ Model:
   depth_threshold: 15.0
 
   save_depth_conf_result: True
+  save_depth_conf_max_workers: 16
   save_debug_info: False
 
   Sparse_Align:
