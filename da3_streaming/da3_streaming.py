@@ -385,6 +385,7 @@ class DA3_Streaming:
         self.streaming_loop_detection_seen = set()
         self.streaming_loop_correction_seen_chunk_pairs = set()
         self.streaming_loop_correction_pending_windows = []
+        self.streaming_alignment_diagnostics = []
         self.streaming_map_epoch = 0
         self.streaming_last_corrected_export_chunk_idx = -10**9
         self.streaming_frame_rotation_cache = {}
@@ -1845,7 +1846,111 @@ class DA3_Streaming:
         print("Estimated Rotation:\n", R)
         print("Estimated Translation:", t)
 
+        self.last_alignment_diagnostics = self._build_alignment_diagnostics(
+            point_map1,
+            conf1,
+            point_map2,
+            conf2,
+            conf_threshold,
+            s,
+            R,
+            t,
+            max_pairs=error_max_pairs,
+        )
+        print("[Alignment Diagnostics]", json.dumps(self.last_alignment_diagnostics))
+
         return s, R, t
+
+    def _build_alignment_diagnostics(
+        self,
+        point_map1,
+        conf1,
+        point_map2,
+        conf2,
+        conf_threshold,
+        s,
+        R,
+        t,
+        max_pairs=None,
+    ):
+        """Summarize adjacent-chunk Sim3 quality without changing the alignment result."""
+        b = min(point_map1.shape[0], point_map2.shape[0])
+        h = min(point_map1.shape[1], point_map2.shape[1])
+        w = min(point_map1.shape[2], point_map2.shape[2])
+        total_pairs = 0
+        sampled_errors = []
+        max_eval_pairs = int(max_pairs or 500000)
+        max_eval_pairs = max(max_eval_pairs, 1)
+        remaining = max_eval_pairs
+
+        for i in range(b):
+            conf_slice1 = conf1[i, :h, :w]
+            conf_slice2 = conf2[i, :h, :w]
+            valid_mask = (conf_slice1 > conf_threshold) & (conf_slice2 > conf_threshold)
+            flat_idx = np.flatnonzero(valid_mask.reshape(-1))
+            pair_count = int(flat_idx.size)
+            total_pairs += pair_count
+            if pair_count == 0 or remaining <= 0:
+                continue
+            take = min(pair_count, remaining)
+            if take < pair_count:
+                chosen = flat_idx[np.linspace(0, pair_count - 1, take, dtype=np.int64)]
+            else:
+                chosen = flat_idx
+            pts1 = point_map1[i, :h, :w].reshape(-1, 3)[chosen]
+            pts2 = point_map2[i, :h, :w].reshape(-1, 3)[chosen]
+            transformed = (s * (R @ pts2.T)).T + t
+            sampled_errors.append(np.linalg.norm(transformed - pts1, axis=1))
+            remaining -= take
+
+        if sampled_errors:
+            errors = np.concatenate(sampled_errors, axis=0)
+            mean_error = float(np.mean(errors))
+            median_error = float(np.median(errors))
+            p95_error = float(np.percentile(errors, 95))
+            max_error = float(np.max(errors))
+            sampled_pair_count = int(errors.size)
+        else:
+            mean_error = None
+            median_error = None
+            p95_error = None
+            max_error = None
+            sampled_pair_count = 0
+
+        R_np = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        t_np = np.asarray(t, dtype=np.float64).reshape(3)
+        rotation_trace = float(np.trace(R_np))
+        cos_angle = np.clip((rotation_trace - 1.0) / 2.0, -1.0, 1.0)
+        rotation_angle_deg = float(np.degrees(np.arccos(cos_angle)))
+        translation_norm = float(np.linalg.norm(t_np))
+        scale = float(np.asarray(s).reshape(-1)[0])
+        flags = []
+        if not np.isfinite(scale) or scale < 0.5 or scale > 2.0:
+            flags.append("scale_out_of_range")
+        if mean_error is not None and mean_error > 0.15:
+            flags.append("high_mean_error")
+        if p95_error is not None and p95_error > 0.50:
+            flags.append("high_p95_error")
+        if sampled_pair_count < 1000:
+            flags.append("low_pair_count")
+
+        return {
+            "schema": "da3_streaming_alignment_diagnostics.v1",
+            "align_method": str(self.config["Model"].get("align_method")),
+            "align_lib": str(self.config["Model"].get("align_lib")),
+            "conf_threshold": float(conf_threshold),
+            "scale": scale,
+            "rotation_angle_deg": rotation_angle_deg,
+            "translation_norm": translation_norm,
+            "mean_error": mean_error,
+            "median_error": median_error,
+            "p95_error": p95_error,
+            "max_error": max_error,
+            "total_pair_count": int(total_pairs),
+            "sampled_pair_count": sampled_pair_count,
+            "flags": flags,
+            "ok": len(flags) == 0,
+        }
 
     def get_loop_sim3_from_loop_predict(self, loop_predict_list):
         loop_sim3_list = []
@@ -2339,6 +2444,13 @@ class DA3_Streaming:
                 sequential_align_started,
             )
             self.sim3_list.append((s, R, t))
+            alignment_diagnostics = dict(getattr(self, "last_alignment_diagnostics", {}) or {})
+            alignment_diagnostics.update({
+                "source_chunk": int(chunk_idx),
+                "target_chunk": int(chunk_idx - 1),
+                "edge": f"{chunk_idx - 1}->{chunk_idx}",
+            })
+            self.streaming_alignment_diagnostics.append(alignment_diagnostics)
 
         loop_info = None
         correction_info = None
@@ -2390,6 +2502,9 @@ class DA3_Streaming:
         )
         if loop_info is not None:
             artifacts["streaming_loop_detection"] = loop_info
+        if self.streaming_alignment_diagnostics:
+            artifacts["streaming_alignment_diagnostics"] = self.streaming_alignment_diagnostics[-1]
+            artifacts["streaming_alignment_history"] = list(self.streaming_alignment_diagnostics)
         if correction_info is not None:
             artifacts["streaming_loop_correction"] = correction_info
             transform_updates = correction_info.get("transform_updates")
@@ -2615,6 +2730,7 @@ class DA3_Streaming:
         self.streaming_loop_detection_seen = set()
         self.streaming_loop_correction_seen_chunk_pairs = set()
         self.streaming_loop_correction_pending_windows = []
+        self.streaming_alignment_diagnostics = []
         self.streaming_map_epoch = 0
         self.streaming_last_corrected_export_chunk_idx = -10**9
         self.streaming_frame_rotation_cache = {}
