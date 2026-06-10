@@ -60,14 +60,16 @@ Loop:
     correction_chunk_pair_top1: True
     correction_min_priority: 0.10
     streaming_keyframe_loop_mode: 'audit' # off | audit | filter
-    streaming_keyframe_min_per_chunk: 1
-    streaming_keyframe_max_per_chunk: 6
+    streaming_keyframe_min_per_chunk: 4
+    streaming_keyframe_max_per_chunk: 8
     streaming_keyframe_min_spacing_frames: 4
     streaming_keyframe_motion_stride: 5
+    streaming_keyframe_coverage_count: 6
     streaming_keyframe_translation_threshold_m: 0.35
     streaming_keyframe_view_angle_threshold_deg: 25.0
     streaming_keyframe_visual_diff_threshold: 0.18
     streaming_keyframe_include_midpoint: True
+    streaming_keyframe_include_boundaries: True
     streaming_pose_gate_enabled: True
     streaming_pose_gate_max_distance_m: 1.5
     streaming_pose_gate_max_view_angle_deg: 60.0

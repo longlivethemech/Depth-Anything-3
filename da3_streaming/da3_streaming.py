@@ -875,6 +875,7 @@ class DA3_Streaming:
             "max_keyframes": max(int(salad_cfg.get("streaming_keyframe_max_per_chunk", 6)), 1),
             "min_spacing": max(int(salad_cfg.get("streaming_keyframe_min_spacing_frames", 4)), 0),
             "motion_stride": max(int(salad_cfg.get("streaming_keyframe_motion_stride", 5)), 1),
+            "coverage_count": max(int(salad_cfg.get("streaming_keyframe_coverage_count", 0)), 0),
             "translation_threshold_m": max(
                 float(salad_cfg.get("streaming_keyframe_translation_threshold_m", 0.35)),
                 0.0,
@@ -888,6 +889,7 @@ class DA3_Streaming:
                 0.0,
             ),
             "include_midpoint": bool(salad_cfg.get("streaming_keyframe_include_midpoint", True)),
+            "include_boundaries": bool(salad_cfg.get("streaming_keyframe_include_boundaries", True)),
         }
 
     def _streaming_keyframe_visual_diffs(self, frames, similarity_matrix):
@@ -944,7 +946,7 @@ class DA3_Streaming:
         midpoint = int(frames[len(frames) // 2])
         candidates = {}
 
-        def add_candidate(frame, reason, score=0.0, details=None):
+        def add_candidate(frame, reason, score=0.0, details=None, pinned=False):
             frame = int(frame)
             if frame < int(frames[0]) or frame > int(frames[-1]):
                 return
@@ -957,9 +959,11 @@ class DA3_Streaming:
                     "translation_delta_m": None,
                     "view_angle_delta_deg": None,
                     "visual_diff": visual_diffs.get(frame),
+                    "pinned": False,
                 },
             )
             item["score"] = max(float(item.get("score", 0.0)), float(score))
+            item["pinned"] = bool(item.get("pinned", False) or pinned)
             if reason not in item["reasons"]:
                 item["reasons"].append(reason)
             if details:
@@ -967,8 +971,22 @@ class DA3_Streaming:
                     if value is not None:
                         item[key] = value
 
+        if config["include_boundaries"]:
+            add_candidate(frames[0], "boundary", score=0.10, pinned=True)
+            add_candidate(frames[-1], "boundary", score=0.10, pinned=True)
         if config["include_midpoint"]:
-            add_candidate(midpoint, "midpoint", score=0.05)
+            add_candidate(midpoint, "midpoint", score=0.10, pinned=True)
+
+        coverage_count = min(
+            int(config["coverage_count"]) or int(config["min_keyframes"]),
+            int(config["max_keyframes"]),
+            int(frames.size),
+        )
+        if coverage_count > 0:
+            for coverage_pos in np.linspace(0, int(frames.size) - 1, coverage_count):
+                coverage_idx = int(round(float(coverage_pos)))
+                add_candidate(frames[coverage_idx], "coverage", score=0.08, pinned=True)
+
 
         stride = int(config["motion_stride"])
         translation_threshold = float(config["translation_threshold_m"])
@@ -1043,7 +1061,14 @@ class DA3_Streaming:
         max_keyframes = min(int(config["max_keyframes"]), len(ordered))
         selected = []
         min_spacing = int(config["min_spacing"])
-        for item in ordered:
+
+        pinned_ordered = sorted(
+            (item for item in candidates.values() if item.get("pinned")),
+            key=lambda item: int(item["frame_index"]),
+        )
+        motion_ordered = [item for item in ordered if not item.get("pinned")]
+
+        for item in pinned_ordered + motion_ordered:
             frame = int(item["frame_index"])
             if min_spacing and any(abs(frame - int(existing["frame_index"])) < min_spacing for existing in selected):
                 continue
@@ -1069,6 +1094,7 @@ class DA3_Streaming:
                     "frame_index": int(item["frame_index"]),
                     "score": float(item.get("score", 0.0)),
                     "reasons": list(item.get("reasons", [])),
+                    "pinned": bool(item.get("pinned", False)),
                     "translation_delta_m": item.get("translation_delta_m"),
                     "view_angle_delta_deg": item.get("view_angle_delta_deg"),
                     "visual_diff": item.get("visual_diff"),
@@ -1239,8 +1265,7 @@ class DA3_Streaming:
                 chunk_pair_count += 1
                 full_block_frame_pair_count += int(full_source_frames.size * full_target_frames.size)
                 block_frame_pair_count += int(source_frames.size * target_frames.size)
-                if keyframe_mode == "filter":
-                    keyframe_pair_count += int(source_frames.size * target_frames.size)
+                keyframe_pair_count += int(source_keyframes.size * target_keyframes.size)
                 similarity_block = similarity_matrix[np.ix_(source_frames, target_frames)]
                 peaks = self._select_block_similarity_peaks(
                     source_frames,
@@ -1280,7 +1305,7 @@ class DA3_Streaming:
             "keyframe_pair_count": int(keyframe_pair_count),
             "keyframe_source_frame_count": int(keyframe_source_frame_count),
             "keyframe_target_frame_count": int(keyframe_target_frame_count),
-            "keyframe_suppressed_pair_count": int(max(full_block_frame_pair_count - block_frame_pair_count, 0)),
+            "keyframe_suppressed_pair_count": int(max(full_block_frame_pair_count - keyframe_pair_count, 0)),
             "keyframes_by_chunk": {
                 str(chunk): info for chunk, info in sorted(keyframes_by_chunk.items())
             },
@@ -1607,6 +1632,40 @@ class DA3_Streaming:
         for chunk_info in loop_pair_block_stats.get("keyframes_by_chunk", {}).values():
             for keyframe in chunk_info.get("keyframes", []):
                 keyframe_frames.add(int(keyframe["frame_index"]))
+        keyframe_frame_list = sorted(keyframe_frames)
+
+        def nearest_keyframe_delta(frame_idx):
+            if not keyframe_frame_list:
+                return None
+            frame_idx = int(frame_idx)
+            return int(min(abs(frame_idx - keyframe) for keyframe in keyframe_frame_list))
+
+        def loop_pair_keyframe_proximity(source_pair):
+            if source_pair is None or len(source_pair) < 2:
+                return {
+                    "source_pair_is_keyframe": False,
+                    "source_pair_keyframe_deltas": None,
+                    "source_pair_keyframe_max_delta": None,
+                    "source_pair_near_keyframe": False,
+                }
+            deltas = [
+                nearest_keyframe_delta(source_pair[0]),
+                nearest_keyframe_delta(source_pair[1]),
+            ]
+            finite_deltas = [delta for delta in deltas if delta is not None]
+            max_delta = max(finite_deltas) if finite_deltas else None
+            near_radius = max(int(keyframe_loop_config.get("min_spacing", 0)), 1)
+            return {
+                "source_pair_is_keyframe": (
+                    int(source_pair[0]) in keyframe_frames
+                    and int(source_pair[1]) in keyframe_frames
+                ),
+                "source_pair_keyframe_deltas": deltas,
+                "source_pair_keyframe_max_delta": max_delta,
+                "source_pair_near_keyframe": (
+                    max_delta is not None and int(max_delta) <= near_radius
+                ),
+            }
         loop_pair_count_before_chunk_gap_filter = len(self.loop_list)
         chunk_gap_pair_suppressed_count = 0
         if min_chunk_gap > 0:
@@ -1777,11 +1836,7 @@ class DA3_Streaming:
                         "pose_gate_pass": bool(annotated.get("pose_gate_pass", True)),
                         "pose_gate_distance_m": annotated.get("pose_gate_distance_m"),
                         "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
-                        "source_pair_is_keyframe": (
-                            annotated["source_pair"] is not None
-                            and int(annotated["source_pair"][0]) in keyframe_frames
-                            and int(annotated["source_pair"][1]) in keyframe_frames
-                        ),
+                        **loop_pair_keyframe_proximity(annotated["source_pair"]),
                         "reject_reason": "below_min_gap",
                     }
                 )
@@ -1811,11 +1866,7 @@ class DA3_Streaming:
                         "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
                         "pose_gate_max_distance_m": annotated.get("pose_gate_max_distance_m"),
                         "pose_gate_max_view_angle_deg": annotated.get("pose_gate_max_view_angle_deg"),
-                        "source_pair_is_keyframe": (
-                            annotated["source_pair"] is not None
-                            and int(annotated["source_pair"][0]) in keyframe_frames
-                            and int(annotated["source_pair"][1]) in keyframe_frames
-                        ),
+                        **loop_pair_keyframe_proximity(annotated["source_pair"]),
                         "reject_reason": "pose_gate",
                     }
                 )
@@ -1881,11 +1932,7 @@ class DA3_Streaming:
                 "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
                 "pose_gate_max_distance_m": annotated.get("pose_gate_max_distance_m"),
                 "pose_gate_max_view_angle_deg": annotated.get("pose_gate_max_view_angle_deg"),
-                "source_pair_is_keyframe": (
-                    annotated["source_pair"] is not None
-                    and int(annotated["source_pair"][0]) in keyframe_frames
-                    and int(annotated["source_pair"][1]) in keyframe_frames
-                ),
+                **loop_pair_keyframe_proximity(annotated["source_pair"]),
             }
             serializable_windows.append(window)
             if is_new_window:
