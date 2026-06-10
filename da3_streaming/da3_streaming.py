@@ -390,6 +390,8 @@ class DA3_Streaming:
         self.streaming_last_corrected_export_chunk_idx = -10**9
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
+        self.streaming_frame_pose_cache = {}
+        self.streaming_chunk_pose_cache = {}
 
         self.loop_enable = self.config["Model"]["loop_enable"]
 
@@ -598,6 +600,43 @@ class DA3_Streaming:
         self.streaming_chunk_rotation_cache[chunk_idx] = rotations
         return rotations
 
+    def _streaming_chunk_global_camera_poses(self, chunk_idx):
+        chunk_idx = int(chunk_idx)
+        cached = self.streaming_chunk_pose_cache.get(chunk_idx)
+        if cached is not None:
+            return cached
+        if chunk_idx < 0 or chunk_idx >= len(self.chunk_indices):
+            return None
+
+        chunk_path = os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx}.npy")
+        if not os.path.exists(chunk_path):
+            return None
+        chunk_data = np.load(chunk_path, allow_pickle=True).item()
+        poses = []
+        sim3 = None
+        if chunk_idx > 0:
+            accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
+            if chunk_idx - 1 < len(accumulated_sim3):
+                sim3 = accumulated_sim3[chunk_idx - 1]
+        for local_idx in range(len(chunk_data.extrinsics)):
+            w2c = np.eye(4)
+            w2c[:3, :] = chunk_data.extrinsics[local_idx]
+            c2w = np.linalg.inv(w2c)
+            rotation = c2w[:3, :3]
+            position = c2w[:3, 3]
+            if sim3 is not None:
+                scale, sim3_rotation, sim3_translation = sim3
+                rotation = sim3_rotation @ rotation
+                position = scale * (sim3_rotation @ position) + sim3_translation
+            poses.append(
+                {
+                    "position": np.asarray(position, dtype=np.float64),
+                    "rotation": np.asarray(rotation, dtype=np.float64),
+                }
+            )
+        self.streaming_chunk_pose_cache[chunk_idx] = poses
+        return poses
+
     def _streaming_frame_global_camera_rotation(self, frame_idx):
         frame_idx = int(frame_idx)
         if frame_idx in self.streaming_frame_rotation_cache:
@@ -613,6 +652,76 @@ class DA3_Streaming:
         rotation = rotations[local_idx]
         self.streaming_frame_rotation_cache[frame_idx] = rotation
         return rotation
+
+    def _streaming_frame_global_camera_pose(self, frame_idx):
+        frame_idx = int(frame_idx)
+        if frame_idx in self.streaming_frame_pose_cache:
+            return self.streaming_frame_pose_cache[frame_idx]
+        chunk_idx = self._frame_chunk_index(frame_idx)
+        if chunk_idx is None:
+            return None
+        begin, _ = self.chunk_indices[chunk_idx]
+        local_idx = frame_idx - int(begin)
+        poses = self._streaming_chunk_global_camera_poses(chunk_idx)
+        if poses is None or local_idx < 0 or local_idx >= len(poses):
+            return None
+        pose = poses[local_idx]
+        self.streaming_frame_pose_cache[frame_idx] = pose
+        return pose
+
+    def _streaming_loop_pose_gate(self, frame_a, frame_b):
+        salad_cfg = self.config["Loop"]["SALAD"]
+        enabled = bool(salad_cfg.get("streaming_pose_gate_enabled", True))
+        max_distance_m = float(salad_cfg.get("streaming_pose_gate_max_distance_m", 1.5))
+        max_view_angle_deg = float(salad_cfg.get("streaming_pose_gate_max_view_angle_deg", 60.0))
+        info = {
+            "pose_gate_enabled": bool(enabled),
+            "pose_gate_pass": True,
+            "pose_gate_reject_reason": None,
+            "pose_gate_frame_a": int(frame_a),
+            "pose_gate_frame_b": int(frame_b),
+            "pose_gate_max_distance_m": float(max_distance_m),
+            "pose_gate_max_view_angle_deg": float(max_view_angle_deg),
+            "pose_gate_distance_m": None,
+            "pose_gate_view_angle_deg": None,
+        }
+        if not enabled:
+            return info
+        pose_a = self._streaming_frame_global_camera_pose(frame_a)
+        pose_b = self._streaming_frame_global_camera_pose(frame_b)
+        if pose_a is None or pose_b is None:
+            info["pose_gate_pass"] = False
+            info["pose_gate_reject_reason"] = "missing_pose"
+            return info
+
+        position_a = np.asarray(pose_a["position"], dtype=np.float64).reshape(3)
+        position_b = np.asarray(pose_b["position"], dtype=np.float64).reshape(3)
+        distance_m = float(np.linalg.norm(position_a - position_b))
+        info["pose_gate_distance_m"] = distance_m
+
+        # DA3 camera coordinates use the camera optical axis as local +Z in
+        # the same convention used for depth back-projection.  Use the full
+        # view-vector angle as a robust first gate; pitch/roll wobble is handled
+        # by the generous default threshold.
+        forward_a = np.asarray(pose_a["rotation"], dtype=np.float64).reshape(3, 3) @ np.asarray([0.0, 0.0, 1.0])
+        forward_b = np.asarray(pose_b["rotation"], dtype=np.float64).reshape(3, 3) @ np.asarray([0.0, 0.0, 1.0])
+        norm_a = float(np.linalg.norm(forward_a))
+        norm_b = float(np.linalg.norm(forward_b))
+        if norm_a > 1e-9 and norm_b > 1e-9:
+            cosine = float(np.dot(forward_a, forward_b) / (norm_a * norm_b))
+            view_angle_deg = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+            info["pose_gate_view_angle_deg"] = view_angle_deg
+
+        if distance_m > max_distance_m:
+            info["pose_gate_pass"] = False
+            info["pose_gate_reject_reason"] = "distance"
+        elif (
+            info["pose_gate_view_angle_deg"] is not None
+            and float(info["pose_gate_view_angle_deg"]) > max_view_angle_deg
+        ):
+            info["pose_gate_pass"] = False
+            info["pose_gate_reject_reason"] = "view_angle"
+        return info
 
     def _camera_path_rotation_metrics(self, frame_idx_a, frame_idx_b):
         start = min(int(frame_idx_a), int(frame_idx_b))
@@ -984,6 +1093,9 @@ class DA3_Streaming:
             chunk_gap,
             rotation_metrics,
         )
+        gate_frame_a = int(source_pair[0]) if source_pair is not None else int(center_a)
+        gate_frame_b = int(source_pair[1]) if source_pair is not None else int(center_b)
+        pose_gate = self._streaming_loop_pose_gate(gate_frame_a, gate_frame_b)
         return {
             "item": item,
             "chunk_a": chunk_a,
@@ -1007,6 +1119,7 @@ class DA3_Streaming:
             "path_rotation_source": rotation_metrics.get("source", "unknown"),
             "rotation_class": rotation_class,
             "rotation_class_rank": rotation_class_rank,
+            **pose_gate,
             **priority_components,
         }
 
@@ -1310,6 +1423,7 @@ class DA3_Streaming:
         rejected_windows = []
         correction_pair_suppressed_count = 0
         correction_priority_suppressed_count = priority_prefilter_suppressed_count
+        pose_gate_rejected_count = 0
         for annotated in exported_loop_results:
             chunk_gap = int(annotated["chunk_gap"])
             frame_gap = int(annotated["frame_gap"])
@@ -1346,7 +1460,40 @@ class DA3_Streaming:
                         "full_turn_score": float(annotated["full_turn_score"]),
                         "opportunity_score": float(annotated["opportunity_score"]),
                         "opportunity_boost": float(annotated["opportunity_boost"]),
+                        "pose_gate_enabled": bool(annotated.get("pose_gate_enabled", False)),
+                        "pose_gate_pass": bool(annotated.get("pose_gate_pass", True)),
+                        "pose_gate_distance_m": annotated.get("pose_gate_distance_m"),
+                        "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
                         "reject_reason": "below_min_gap",
+                    }
+                )
+                continue
+            if not bool(annotated.get("pose_gate_pass", True)):
+                pose_gate_rejected_count += 1
+                rejected_windows.append(
+                    {
+                        "chunk_a": int(annotated["chunk_a"]),
+                        "range_a": [int(annotated["range_a"][0]), int(annotated["range_a"][1])],
+                        "chunk_b": int(annotated["chunk_b"]),
+                        "range_b": [int(annotated["range_b"][0]), int(annotated["range_b"][1])],
+                        "center_a": int(annotated["center_a"]),
+                        "center_b": int(annotated["center_b"]),
+                        "chunk_gap": int(chunk_gap),
+                        "frame_gap": int(frame_gap),
+                        "similarity": float(annotated["similarity"]),
+                        "source_pair": annotated["source_pair"],
+                        "rotation_class": annotated["rotation_class"],
+                        "priority_score": float(annotated["priority_score"]),
+                        "pose_gate_enabled": bool(annotated.get("pose_gate_enabled", False)),
+                        "pose_gate_pass": bool(annotated.get("pose_gate_pass", False)),
+                        "pose_gate_reject_reason": annotated.get("pose_gate_reject_reason"),
+                        "pose_gate_frame_a": annotated.get("pose_gate_frame_a"),
+                        "pose_gate_frame_b": annotated.get("pose_gate_frame_b"),
+                        "pose_gate_distance_m": annotated.get("pose_gate_distance_m"),
+                        "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
+                        "pose_gate_max_distance_m": annotated.get("pose_gate_max_distance_m"),
+                        "pose_gate_max_view_angle_deg": annotated.get("pose_gate_max_view_angle_deg"),
+                        "reject_reason": "pose_gate",
                     }
                 )
                 continue
@@ -1402,6 +1549,15 @@ class DA3_Streaming:
                 "correction_pair_key": [int(correction_pair_key[0]), int(correction_pair_key[1])],
                 "correction_pair_unused": bool(correction_pair_unused),
                 "correction_chunk_pair_top1": bool(correction_chunk_pair_top1),
+                "pose_gate_enabled": bool(annotated.get("pose_gate_enabled", False)),
+                "pose_gate_pass": bool(annotated.get("pose_gate_pass", True)),
+                "pose_gate_reject_reason": annotated.get("pose_gate_reject_reason"),
+                "pose_gate_frame_a": annotated.get("pose_gate_frame_a"),
+                "pose_gate_frame_b": annotated.get("pose_gate_frame_b"),
+                "pose_gate_distance_m": annotated.get("pose_gate_distance_m"),
+                "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
+                "pose_gate_max_distance_m": annotated.get("pose_gate_max_distance_m"),
+                "pose_gate_max_view_angle_deg": annotated.get("pose_gate_max_view_angle_deg"),
             }
             serializable_windows.append(window)
             if is_new_window:
@@ -1457,6 +1613,8 @@ class DA3_Streaming:
             "correction_seen_chunk_pair_count": len(self.streaming_loop_correction_seen_chunk_pairs),
             "correction_pair_suppressed_count": correction_pair_suppressed_count,
             "correction_priority_suppressed_count": correction_priority_suppressed_count,
+            "pose_gate_enabled": bool(self.config["Loop"]["SALAD"].get("streaming_pose_gate_enabled", True)),
+            "pose_gate_rejected_count": pose_gate_rejected_count,
             "rejected_loop_window_count": len(rejected_windows),
             "rejected_loop_windows": rejected_windows,
             "min_chunk_gap": min_chunk_gap,
@@ -1513,6 +1671,8 @@ class DA3_Streaming:
         self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
+        self.streaming_frame_pose_cache = {}
+        self.streaming_chunk_pose_cache = {}
         optimize_sec = print_timing("da3.streaming_loop.optimize", optimize_started)
         after_accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
         transform_updates = self._streaming_loop_transform_updates(
@@ -2735,6 +2895,8 @@ class DA3_Streaming:
         self.streaming_last_corrected_export_chunk_idx = -10**9
         self.streaming_frame_rotation_cache = {}
         self.streaming_chunk_rotation_cache = {}
+        self.streaming_frame_pose_cache = {}
+        self.streaming_chunk_pose_cache = {}
         self.skyseg_session = None
         if not self._uses_preloaded_model:
             self.model = None

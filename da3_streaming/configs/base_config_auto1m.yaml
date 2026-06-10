@@ -42,6 +42,9 @@ Loop:
     batch_size: 32
     similarity_threshold: 0.85
     top_k: 5
+    streaming_pose_gate_enabled: True
+    streaming_pose_gate_max_distance_m: 1.5
+    streaming_pose_gate_max_view_angle_deg: 60.0
     use_nms: True
     nms_threshold: 25
     nms_mode: 'gap_aware'

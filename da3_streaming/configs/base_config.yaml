@@ -59,6 +59,9 @@ Loop:
     streaming_incremental_lookback_chunks: -1
     correction_chunk_pair_top1: True
     correction_min_priority: 0.10
+    streaming_pose_gate_enabled: True
+    streaming_pose_gate_max_distance_m: 1.5
+    streaming_pose_gate_max_view_angle_deg: 60.0
     cluster_nms_enabled: True
     cluster_frame_radius: 10
     cluster_peak_deg_radius: 30.0
