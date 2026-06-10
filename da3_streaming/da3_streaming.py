@@ -392,6 +392,7 @@ class DA3_Streaming:
         self.streaming_chunk_rotation_cache = {}
         self.streaming_frame_pose_cache = {}
         self.streaming_chunk_pose_cache = {}
+        self.streaming_loop_keyframe_cache = {}
 
         self.loop_enable = self.config["Model"]["loop_enable"]
 
@@ -855,6 +856,253 @@ class DA3_Streaming:
             dtype=np.int64,
         )
 
+    def _streaming_loop_keyframe_config(self):
+        salad_cfg = self.config["Loop"]["SALAD"]
+        mode = str(
+            os.environ.get(
+                "DA3_STREAMING_KEYFRAME_LOOP_MODE",
+                salad_cfg.get("streaming_keyframe_loop_mode", "off"),
+            )
+        ).lower()
+        if mode in ("0", "false", "none", "disabled"):
+            mode = "off"
+        if mode not in ("off", "audit", "filter"):
+            mode = "audit"
+        return {
+            "mode": mode,
+            "enabled": mode != "off",
+            "min_keyframes": max(int(salad_cfg.get("streaming_keyframe_min_per_chunk", 1)), 1),
+            "max_keyframes": max(int(salad_cfg.get("streaming_keyframe_max_per_chunk", 6)), 1),
+            "min_spacing": max(int(salad_cfg.get("streaming_keyframe_min_spacing_frames", 4)), 0),
+            "motion_stride": max(int(salad_cfg.get("streaming_keyframe_motion_stride", 5)), 1),
+            "translation_threshold_m": max(
+                float(salad_cfg.get("streaming_keyframe_translation_threshold_m", 0.35)),
+                0.0,
+            ),
+            "view_angle_threshold_deg": max(
+                float(salad_cfg.get("streaming_keyframe_view_angle_threshold_deg", 25.0)),
+                0.0,
+            ),
+            "visual_diff_threshold": max(
+                float(salad_cfg.get("streaming_keyframe_visual_diff_threshold", 0.18)),
+                0.0,
+            ),
+            "include_midpoint": bool(salad_cfg.get("streaming_keyframe_include_midpoint", True)),
+        }
+
+    def _streaming_keyframe_visual_diffs(self, frames, similarity_matrix):
+        diffs = {}
+        if similarity_matrix is None or len(frames) <= 1:
+            return diffs
+        frame_count = int(similarity_matrix.shape[0])
+        prev_frame = int(frames[0])
+        for frame in frames[1:]:
+            frame = int(frame)
+            if (
+                0 <= prev_frame < frame_count
+                and 0 <= frame < frame_count
+            ):
+                similarity = float(similarity_matrix[prev_frame, frame])
+                diffs[frame] = float(max(0.0, 1.0 - similarity))
+            prev_frame = frame
+        return diffs
+
+    def _angle_between_vectors_deg(self, vec_a, vec_b):
+        vec_a = np.asarray(vec_a, dtype=np.float64).reshape(3)
+        vec_b = np.asarray(vec_b, dtype=np.float64).reshape(3)
+        norm_a = float(np.linalg.norm(vec_a))
+        norm_b = float(np.linalg.norm(vec_b))
+        if norm_a <= 1e-9 or norm_b <= 1e-9:
+            return None
+        cosine = float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+        return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+    def _streaming_frame_forward_vector(self, frame_idx):
+        pose = self._streaming_frame_global_camera_pose(frame_idx)
+        if pose is None:
+            return None
+        return np.asarray(pose["rotation"], dtype=np.float64).reshape(3, 3) @ np.asarray([0.0, 0.0, 1.0])
+
+    def _select_streaming_loop_keyframes_for_chunk(self, chunk_idx, frame_count, similarity_matrix=None):
+        config = self._streaming_loop_keyframe_config()
+        frames = self._chunk_frame_indices_for_similarity(chunk_idx, frame_count)
+        if frames.size == 0:
+            return {
+                "chunk_index": int(chunk_idx),
+                "frame_range": None,
+                "frame_count": 0,
+                "keyframes": [],
+                "keyframe_count": 0,
+                "mode": config["mode"],
+                "enabled": bool(config["enabled"]),
+                "reason": "empty_chunk",
+                "config": config,
+            }
+
+        frames = np.asarray(frames, dtype=np.int64)
+        visual_diffs = self._streaming_keyframe_visual_diffs(frames, similarity_matrix)
+        midpoint = int(frames[len(frames) // 2])
+        candidates = {}
+
+        def add_candidate(frame, reason, score=0.0, details=None):
+            frame = int(frame)
+            if frame < int(frames[0]) or frame > int(frames[-1]):
+                return
+            item = candidates.setdefault(
+                frame,
+                {
+                    "frame_index": frame,
+                    "score": 0.0,
+                    "reasons": [],
+                    "translation_delta_m": None,
+                    "view_angle_delta_deg": None,
+                    "visual_diff": visual_diffs.get(frame),
+                },
+            )
+            item["score"] = max(float(item.get("score", 0.0)), float(score))
+            if reason not in item["reasons"]:
+                item["reasons"].append(reason)
+            if details:
+                for key, value in details.items():
+                    if value is not None:
+                        item[key] = value
+
+        if config["include_midpoint"]:
+            add_candidate(midpoint, "midpoint", score=0.05)
+
+        stride = int(config["motion_stride"])
+        translation_threshold = float(config["translation_threshold_m"])
+        view_angle_threshold = float(config["view_angle_threshold_deg"])
+        visual_diff_threshold = float(config["visual_diff_threshold"])
+        last_anchor_frame = int(frames[0])
+        last_anchor_pose = self._streaming_frame_global_camera_pose(last_anchor_frame)
+        last_anchor_forward = self._streaming_frame_forward_vector(last_anchor_frame)
+        for frame in frames[::stride]:
+            frame = int(frame)
+            pose = self._streaming_frame_global_camera_pose(frame)
+            forward = self._streaming_frame_forward_vector(frame)
+            translation_delta = None
+            view_angle_delta = None
+            motion_score = 0.0
+            if pose is not None and last_anchor_pose is not None:
+                translation_delta = float(
+                    np.linalg.norm(
+                        np.asarray(pose["position"], dtype=np.float64)
+                        - np.asarray(last_anchor_pose["position"], dtype=np.float64)
+                    )
+                )
+                if translation_threshold > 0.0:
+                    motion_score = max(motion_score, translation_delta / translation_threshold)
+            if forward is not None and last_anchor_forward is not None:
+                view_angle_delta = self._angle_between_vectors_deg(forward, last_anchor_forward)
+                if view_angle_delta is not None and view_angle_threshold > 0.0:
+                    motion_score = max(motion_score, view_angle_delta / view_angle_threshold)
+            visual_diff = visual_diffs.get(frame)
+            visual_score = (
+                float(visual_diff) / visual_diff_threshold
+                if visual_diff is not None and visual_diff_threshold > 0.0
+                else 0.0
+            )
+            if (
+                (translation_delta is not None and translation_delta >= translation_threshold > 0.0)
+                or (view_angle_delta is not None and view_angle_delta >= view_angle_threshold > 0.0)
+                or (visual_diff is not None and visual_diff >= visual_diff_threshold > 0.0)
+            ):
+                reasons = []
+                if translation_delta is not None and translation_delta >= translation_threshold > 0.0:
+                    reasons.append("translation")
+                if view_angle_delta is not None and view_angle_delta >= view_angle_threshold > 0.0:
+                    reasons.append("view_angle")
+                if visual_diff is not None and visual_diff >= visual_diff_threshold > 0.0:
+                    reasons.append("visual_diff")
+                add_candidate(
+                    frame,
+                    "+".join(reasons) or "motion",
+                    score=max(motion_score, visual_score),
+                    details={
+                        "translation_delta_m": translation_delta,
+                        "view_angle_delta_deg": view_angle_delta,
+                        "visual_diff": visual_diff,
+                    },
+                )
+                last_anchor_frame = frame
+                last_anchor_pose = pose
+                last_anchor_forward = forward
+
+        if not candidates:
+            add_candidate(midpoint, "fallback_midpoint", score=0.0)
+
+        ordered = sorted(
+            candidates.values(),
+            key=lambda item: (
+                -float(item.get("score", 0.0)),
+                abs(int(item["frame_index"]) - midpoint),
+                int(item["frame_index"]),
+            ),
+        )
+        max_keyframes = min(int(config["max_keyframes"]), len(ordered))
+        selected = []
+        min_spacing = int(config["min_spacing"])
+        for item in ordered:
+            frame = int(item["frame_index"])
+            if min_spacing and any(abs(frame - int(existing["frame_index"])) < min_spacing for existing in selected):
+                continue
+            selected.append(item)
+            if len(selected) >= max_keyframes:
+                break
+        if len(selected) < int(config["min_keyframes"]):
+            for item in sorted(candidates.values(), key=lambda x: abs(int(x["frame_index"]) - midpoint)):
+                if all(int(item["frame_index"]) != int(existing["frame_index"]) for existing in selected):
+                    selected.append(item)
+                if len(selected) >= int(config["min_keyframes"]):
+                    break
+        if not selected:
+            selected = [candidates[midpoint]]
+
+        selected = sorted(selected, key=lambda item: int(item["frame_index"]))
+        return {
+            "chunk_index": int(chunk_idx),
+            "frame_range": [int(frames[0]), int(frames[-1]) + 1],
+            "frame_count": int(frames.size),
+            "keyframes": [
+                {
+                    "frame_index": int(item["frame_index"]),
+                    "score": float(item.get("score", 0.0)),
+                    "reasons": list(item.get("reasons", [])),
+                    "translation_delta_m": item.get("translation_delta_m"),
+                    "view_angle_delta_deg": item.get("view_angle_delta_deg"),
+                    "visual_diff": item.get("visual_diff"),
+                }
+                for item in selected
+            ],
+            "keyframe_count": int(len(selected)),
+            "mode": config["mode"],
+            "enabled": bool(config["enabled"]),
+            "config": config,
+        }
+
+    def _streaming_loop_keyframe_info(self, chunk_idx, frame_count, similarity_matrix=None):
+        chunk_idx = int(chunk_idx)
+        cached = self.streaming_loop_keyframe_cache.get(chunk_idx)
+        if cached is not None:
+            return cached
+        info = self._select_streaming_loop_keyframes_for_chunk(
+            chunk_idx,
+            frame_count,
+            similarity_matrix=similarity_matrix,
+        )
+        self.streaming_loop_keyframe_cache[chunk_idx] = info
+        return info
+
+    def _streaming_loop_keyframe_indices(self, chunk_idx, frame_count, similarity_matrix=None):
+        info = self._streaming_loop_keyframe_info(
+            chunk_idx,
+            frame_count,
+            similarity_matrix=similarity_matrix,
+        )
+        frames = [int(item["frame_index"]) for item in info.get("keyframes", [])]
+        return np.asarray(frames, dtype=np.int64)
+
     def _select_block_similarity_peaks(
         self,
         source_frames,
@@ -908,6 +1156,7 @@ class DA3_Streaming:
         topk_per_chunk_pair=1,
         peak_nms_radius=10,
         min_similarity=0.0,
+        keyframe_mode="off",
     ):
         similarity_matrix = self._ensure_streaming_loop_similarity_matrix()
         if similarity_matrix is None:
@@ -917,6 +1166,12 @@ class DA3_Streaming:
             }
 
         frame_count = int(similarity_matrix.shape[0])
+        keyframe_config = self._streaming_loop_keyframe_config()
+        if keyframe_mode is None:
+            keyframe_mode = keyframe_config["mode"]
+        keyframe_mode = str(keyframe_mode).lower()
+        if keyframe_mode not in ("off", "audit", "filter"):
+            keyframe_mode = "audit"
         processed_chunk_count = len(self.chunk_indices)
         source_chunks = []
         for source_chunk in range(
@@ -930,22 +1185,62 @@ class DA3_Streaming:
         selected_pairs = []
         chunk_pair_count = 0
         block_frame_pair_count = 0
+        full_block_frame_pair_count = 0
         similarity_suppressed_count = 0
         empty_block_count = 0
+        keyframes_by_chunk = {}
+        keyframe_pair_count = 0
+        keyframe_source_frame_count = 0
+        keyframe_target_frame_count = 0
         for source_chunk in source_chunks:
-            source_frames = self._chunk_frame_indices_for_similarity(source_chunk, frame_count)
-            if source_frames.size == 0:
+            full_source_frames = self._chunk_frame_indices_for_similarity(source_chunk, frame_count)
+            if full_source_frames.size == 0:
                 continue
+            source_keyframes = self._streaming_loop_keyframe_indices(
+                source_chunk,
+                frame_count,
+                similarity_matrix=similarity_matrix,
+            )
+            keyframes_by_chunk[int(source_chunk)] = self._streaming_loop_keyframe_info(
+                source_chunk,
+                frame_count,
+                similarity_matrix=similarity_matrix,
+            )
+            source_frames = (
+                source_keyframes
+                if keyframe_mode == "filter" and source_keyframes.size > 0
+                else full_source_frames
+            )
+            keyframe_source_frame_count += int(source_keyframes.size)
             for target_chunk in range(0, source_chunk):
                 chunk_gap = abs(int(source_chunk) - int(target_chunk))
                 if chunk_gap < int(min_chunk_gap):
                     continue
-                target_frames = self._chunk_frame_indices_for_similarity(target_chunk, frame_count)
-                if target_frames.size == 0:
+                full_target_frames = self._chunk_frame_indices_for_similarity(target_chunk, frame_count)
+                if full_target_frames.size == 0:
                     empty_block_count += 1
                     continue
+                target_keyframes = self._streaming_loop_keyframe_indices(
+                    target_chunk,
+                    frame_count,
+                    similarity_matrix=similarity_matrix,
+                )
+                keyframes_by_chunk[int(target_chunk)] = self._streaming_loop_keyframe_info(
+                    target_chunk,
+                    frame_count,
+                    similarity_matrix=similarity_matrix,
+                )
+                target_frames = (
+                    target_keyframes
+                    if keyframe_mode == "filter" and target_keyframes.size > 0
+                    else full_target_frames
+                )
+                keyframe_target_frame_count += int(target_keyframes.size)
                 chunk_pair_count += 1
+                full_block_frame_pair_count += int(full_source_frames.size * full_target_frames.size)
                 block_frame_pair_count += int(source_frames.size * target_frames.size)
+                if keyframe_mode == "filter":
+                    keyframe_pair_count += int(source_frames.size * target_frames.size)
                 similarity_block = similarity_matrix[np.ix_(source_frames, target_frames)]
                 peaks = self._select_block_similarity_peaks(
                     source_frames,
@@ -969,6 +1264,7 @@ class DA3_Streaming:
             "frame_count": int(frame_count),
             "chunk_pair_count": int(chunk_pair_count),
             "block_frame_pair_count": int(block_frame_pair_count),
+            "full_block_frame_pair_count": int(full_block_frame_pair_count),
             "selected_pair_count": int(len(selected_pairs)),
             "similarity_suppressed_chunk_pair_count": int(similarity_suppressed_count),
             "empty_block_count": int(empty_block_count),
@@ -978,6 +1274,16 @@ class DA3_Streaming:
             "topk_per_chunk_pair": int(topk_per_chunk_pair),
             "peak_nms_radius": int(peak_nms_radius),
             "min_similarity": float(min_similarity),
+            "keyframe_mode": keyframe_mode,
+            "keyframe_enabled": bool(keyframe_mode != "off"),
+            "keyframe_filter_active": bool(keyframe_mode == "filter"),
+            "keyframe_pair_count": int(keyframe_pair_count),
+            "keyframe_source_frame_count": int(keyframe_source_frame_count),
+            "keyframe_target_frame_count": int(keyframe_target_frame_count),
+            "keyframe_suppressed_pair_count": int(max(full_block_frame_pair_count - block_frame_pair_count, 0)),
+            "keyframes_by_chunk": {
+                str(chunk): info for chunk, info in sorted(keyframes_by_chunk.items())
+            },
         }
 
     def _loop_priority_components(
@@ -1234,6 +1540,8 @@ class DA3_Streaming:
                 "full_pair_closures",
             )
         )
+        keyframe_loop_config = self._streaming_loop_keyframe_config()
+        keyframe_loop_mode = str(keyframe_loop_config["mode"])
 
         self.loop_detector.image_paths = None
         self.loop_detector.loop_closures = None
@@ -1274,6 +1582,7 @@ class DA3_Streaming:
                     ),
                     0.0,
                 ),
+                keyframe_mode=keyframe_loop_mode,
             )
             loop_pair_block_stats["wall_sec"] = print_timing(
                 "da3.streaming_loop.chunk_pair_block_search",
@@ -1294,6 +1603,10 @@ class DA3_Streaming:
                 lookback_chunks=lookback_chunks,
             )
         loop_pair_lookback_stats = getattr(self, "streaming_loop_last_lookback_stats", {})
+        keyframe_frames = set()
+        for chunk_info in loop_pair_block_stats.get("keyframes_by_chunk", {}).values():
+            for keyframe in chunk_info.get("keyframes", []):
+                keyframe_frames.add(int(keyframe["frame_index"]))
         loop_pair_count_before_chunk_gap_filter = len(self.loop_list)
         chunk_gap_pair_suppressed_count = 0
         if min_chunk_gap > 0:
@@ -1464,6 +1777,11 @@ class DA3_Streaming:
                         "pose_gate_pass": bool(annotated.get("pose_gate_pass", True)),
                         "pose_gate_distance_m": annotated.get("pose_gate_distance_m"),
                         "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
+                        "source_pair_is_keyframe": (
+                            annotated["source_pair"] is not None
+                            and int(annotated["source_pair"][0]) in keyframe_frames
+                            and int(annotated["source_pair"][1]) in keyframe_frames
+                        ),
                         "reject_reason": "below_min_gap",
                     }
                 )
@@ -1493,6 +1811,11 @@ class DA3_Streaming:
                         "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
                         "pose_gate_max_distance_m": annotated.get("pose_gate_max_distance_m"),
                         "pose_gate_max_view_angle_deg": annotated.get("pose_gate_max_view_angle_deg"),
+                        "source_pair_is_keyframe": (
+                            annotated["source_pair"] is not None
+                            and int(annotated["source_pair"][0]) in keyframe_frames
+                            and int(annotated["source_pair"][1]) in keyframe_frames
+                        ),
                         "reject_reason": "pose_gate",
                     }
                 )
@@ -1558,6 +1881,11 @@ class DA3_Streaming:
                 "pose_gate_view_angle_deg": annotated.get("pose_gate_view_angle_deg"),
                 "pose_gate_max_distance_m": annotated.get("pose_gate_max_distance_m"),
                 "pose_gate_max_view_angle_deg": annotated.get("pose_gate_max_view_angle_deg"),
+                "source_pair_is_keyframe": (
+                    annotated["source_pair"] is not None
+                    and int(annotated["source_pair"][0]) in keyframe_frames
+                    and int(annotated["source_pair"][1]) in keyframe_frames
+                ),
             }
             serializable_windows.append(window)
             if is_new_window:
@@ -1589,6 +1917,13 @@ class DA3_Streaming:
             "loop_pair_lookback_stats": loop_pair_lookback_stats,
             "streaming_candidate_mode": streaming_candidate_mode,
             "loop_pair_block_stats": loop_pair_block_stats,
+            "keyframe_loop_mode": keyframe_loop_mode,
+            "keyframe_loop_enabled": bool(keyframe_loop_mode != "off"),
+            "keyframe_filter_active": bool(keyframe_loop_mode == "filter"),
+            "keyframe_config": keyframe_loop_config,
+            "keyframes_by_chunk": loop_pair_block_stats.get("keyframes_by_chunk", {}),
+            "keyframe_pair_count": int(loop_pair_block_stats.get("keyframe_pair_count", 0)),
+            "keyframe_suppressed_pair_count": int(loop_pair_block_stats.get("keyframe_suppressed_pair_count", 0)),
             "rotation_aware_priority": True,
             "rotation_class_counts": rotation_class_counts,
             "loop_pairs": loop_pairs,
@@ -1673,6 +2008,7 @@ class DA3_Streaming:
         self.streaming_chunk_rotation_cache = {}
         self.streaming_frame_pose_cache = {}
         self.streaming_chunk_pose_cache = {}
+        self.streaming_loop_keyframe_cache = {}
         optimize_sec = print_timing("da3.streaming_loop.optimize", optimize_started)
         after_accumulated_sim3 = accumulate_sim3_transforms(list(self.sim3_list))
         transform_updates = self._streaming_loop_transform_updates(
@@ -2897,6 +3233,7 @@ class DA3_Streaming:
         self.streaming_chunk_rotation_cache = {}
         self.streaming_frame_pose_cache = {}
         self.streaming_chunk_pose_cache = {}
+        self.streaming_loop_keyframe_cache = {}
         self.skyseg_session = None
         if not self._uses_preloaded_model:
             self.model = None
